@@ -43,6 +43,36 @@ services:
       db:
         condition: service_healthy
 
+  vk_bot:
+    build: .
+    restart: always
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-bot_user}:${POSTGRES_PASSWORD:-bot_password}@db:5432/${POSTGRES_DB:-bot_db}
+    command: sh -c "alembic upgrade head && exec python vk_bot.py"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Почасовые симптомы для заражённых: раз в 5 минут проверка (интервал «час» внутри логики game_logic)
+  symptom_cron:
+    build: .
+    restart: always
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-bot_user}:${POSTGRES_PASSWORD:-bot_password}@db:5432/${POSTGRES_DB:-bot_db}
+    command: >
+      sh -c "while true; do python scripts/hourly_symptom_cron.py; sleep 300; done"
+    depends_on:
+      db:
+        condition: service_healthy
+
 volumes:
   postgres_data:
   pgadmin_data:

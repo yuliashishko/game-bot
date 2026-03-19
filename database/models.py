@@ -2,7 +2,7 @@ import enum
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from sqlalchemy import String, Integer, Boolean, ForeignKey, DateTime, Enum
+from sqlalchemy import String, Integer, Boolean, ForeignKey, DateTime, Enum, BigInteger
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -93,6 +93,12 @@ class User(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     character_name: Mapped[str] = mapped_column(String)
     tg_username: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    vk_username: Mapped[Optional[str]] = mapped_column(String, nullable=True, unique=True)  # VK screen_name или отображаемое имя
+    # Идентификаторы диалогов для отправки сообщений и флаги подключения платформ
+    telegram_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, unique=True)  # TG user id, в личке = chat_id
+    vk_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, unique=True)  # VK peer_id (user id в личке)
+    tg_connected: Mapped[bool] = mapped_column(Boolean, default=False)
+    vk_connected: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
     

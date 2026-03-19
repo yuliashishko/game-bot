@@ -138,7 +138,17 @@ class UserActionLoggingMiddleware(BaseMiddleware):
             except Exception as e:
                 user_actions_logger.warning("Не удалось сохранить действие в БД: %s", e)
 
-        return await handler(event, data)
+        try:
+            return await handler(event, data)
+        except Exception as e:
+            user_actions_logger.exception("Ошибка в обработчике: %s", e)
+            try:
+                msg = event.message or (event.callback_query.message if event.callback_query else None)
+                if msg:
+                    await msg.answer("Произошла ошибка. Попробуйте позже или обратитесь к администратору.")
+            except Exception:
+                pass
+            raise
 
 
 def get_main_keyboard(night_visible: bool = False, has_craft_recipe: bool = False) -> ReplyKeyboardMarkup:
@@ -163,6 +173,31 @@ async def get_night_active() -> bool:
         return row.night_active if row else False
 
 
+async def get_user_from_telegram(session, telegram_id: int | None, tg_username: str | None):
+    """
+    Находит персонажа по telegram_id или tg_username. При нахождении по username
+    проставляет telegram_id и tg_connected=True. Загружает slots + skill + disease.
+    """
+    opts = [
+        selectinload(User.slots).selectinload(Slot.skill),
+        selectinload(User.slots).selectinload(Slot.disease),
+    ]
+    q = select(User).options(*opts)
+    if telegram_id is not None:
+        r = await session.execute(q.where(User.telegram_id == telegram_id))
+        u = r.scalar_one_or_none()
+        if u:
+            return u
+    if tg_username:
+        r = await session.execute(q.where(User.tg_username == tg_username))
+        u = r.scalar_one_or_none()
+        if u and telegram_id is not None:
+            u.telegram_id = telegram_id
+            u.tg_connected = True
+        return u
+    return None
+
+
 @dp.message(CommandStart())
 async def command_start_handler(message: Message) -> None:
     """
@@ -173,27 +208,21 @@ async def command_start_handler(message: Message) -> None:
         await message.answer("Для работы с ботом у вас должен быть установлен <b>@username</b> в Telegram.")
         return
 
+    telegram_id = message.from_user.id
     async with async_session() as session:
-        result = await session.execute(
-            select(User)
-            .options(selectinload(User.slots).selectinload(Slot.skill))
-            .where(User.tg_username == username)
-        )
-        user = result.scalar_one_or_none()
-
+        user = await get_user_from_telegram(session, telegram_id, username)
         if not user:
             await message.answer("Извините, вы не подключены к системе (ваш username не найден в базе).")
             return
-
         user.is_active = True
         await session.commit()
 
-        night_active = await get_night_active()
-        has_craft = _user_has_medicine_recipe(user)
-        await message.answer(
-            f"Добро пожаловать, <b>@{username}</b>! Ваш профиль успешно активирован.",
-            reply_markup=get_main_keyboard(night_active, has_craft)
-        )
+    night_active = await get_night_active()
+    has_craft = _user_has_medicine_recipe(user)
+    await message.answer(
+        f"Добро пожаловать, <b>@{username}</b>! Ваш профиль успешно активирован.",
+        reply_markup=get_main_keyboard(night_active, has_craft)
+    )
 
 
 @dp.message(F.text == "👤 Мой профиль")
@@ -207,21 +236,13 @@ async def command_me_handler(message: Message) -> None:
         await message.answer("Для работы с ботом у вас должен быть установлен <b>@username</b> в Telegram.")
         return
 
+    telegram_id = message.from_user.id
     async with async_session() as session:
-        # Ищем пользователя со всеми его слотами, навыками и болезнями
-        result = await session.execute(
-            select(User)
-            .options(
-                selectinload(User.slots).selectinload(Slot.skill),
-                selectinload(User.slots).selectinload(Slot.disease)
-            )
-            .where(User.tg_username == username)
-        )
-        user = result.scalar_one_or_none()
-
+        user = await get_user_from_telegram(session, telegram_id, username)
         if not user:
             await message.answer("Вы не подключены к системе (ваш username не найден в базе).")
             return
+        await session.commit()
 
         health_max = 0
         health_current = 0
@@ -326,25 +347,16 @@ async def night_location_handler(message: Message, state: FSMContext) -> None:
             return
 
         loc_name_normalized = (loc.name or "").strip().lower()
+        telegram_id = message.from_user.id if message.from_user else None
         if loc_name_normalized == "степь":
-            result = await session.execute(
-                select(User)
-                .options(selectinload(User.slots).selectinload(Slot.skill))
-                .where(User.tg_username == username)
-            )
-            user = result.scalar_one_or_none()
+            user = await get_user_from_telegram(session, telegram_id, username)
             if user and "Привычный к степи" not in _user_active_skill_names(user):
                 await state.clear()
                 await message.answer("Вы не можете ночевать здесь: у вас нет навыка «Привычный к степи».")
                 return
 
         await state.update_data(location_id=loc.id)
-        result = await session.execute(
-            select(User)
-            .options(selectinload(User.slots).selectinload(Slot.skill))
-            .where(User.tg_username == username)
-        )
-        user = result.scalar_one_or_none()
+        user = await get_user_from_telegram(session, telegram_id, username)
 
     if not user:
         await state.clear()
@@ -402,13 +414,10 @@ async def night_painkiller_handler(message: Message, state: FSMContext) -> None:
         await state.clear()
         return
 
+    telegram_id = message.from_user.id if message.from_user else None
     async with async_session() as session:
-        result = await session.execute(
-            select(User)
-            .options(selectinload(User.slots).selectinload(Slot.skill))
-            .where(User.tg_username == username)
-        )
-        user = result.scalar_one_or_none()
+        user = await get_user_from_telegram(session, telegram_id, username)
+        await session.commit()
 
     if user and "Непоседа" in _user_active_skill_names(user):
         await state.set_state(NightStates.use_restless)
@@ -440,6 +449,7 @@ async def _night_finalize(message: Message, state: FSMContext) -> None:
     use_restless = data.get("use_restless", False)
     await state.clear()
 
+    telegram_id = message.from_user.id if message.from_user else None
     async with async_session() as session:
         result = await session.execute(select(Location).where(Location.id == location_id))
         location = result.scalar_one_or_none()
@@ -447,15 +457,7 @@ async def _night_finalize(message: Message, state: FSMContext) -> None:
             await message.answer("Локация не найдена.")
             return
 
-        result = await session.execute(
-            select(User)
-            .options(
-                selectinload(User.slots).selectinload(Slot.skill),
-                selectinload(User.slots).selectinload(Slot.disease)
-            )
-            .where(User.tg_username == username)
-        )
-        user = result.scalar_one_or_none()
+        user = await get_user_from_telegram(session, telegram_id, username)
         if not user or not user.is_alive:
             await message.answer("Персонаж не найден или мёртв.")
             return
@@ -532,17 +534,10 @@ async def process_wound_callback(callback_query: CallbackQuery) -> None:
         await callback_query.answer("Нет username", show_alert=True)
         return
 
+    telegram_id = callback_query.from_user.id
     async with async_session() as session:
-        # Load user and slots
-        result = await session.execute(
-            select(User)
-            .options(
-                selectinload(User.slots).selectinload(Slot.skill),
-                selectinload(User.slots).selectinload(Slot.disease)
-            )
-            .where(User.tg_username == username)
-        )
-        user = result.scalar_one_or_none()
+        user = await get_user_from_telegram(session, telegram_id, username)
+        await session.commit()
 
         if not user:
             await callback_query.answer("Вы не зарегистрированы.", show_alert=True)
@@ -716,6 +711,7 @@ async def process_trauma_callback(callback_query: CallbackQuery) -> None:
         await callback_query.answer("Нет username", show_alert=True)
         return
 
+    telegram_id = callback_query.from_user.id
     async with async_session() as session:
         result = await session.execute(
             select(Disease).where(
@@ -728,15 +724,8 @@ async def process_trauma_callback(callback_query: CallbackQuery) -> None:
             await callback_query.answer("Травма с таким кодом не найдена.", show_alert=True)
             return
 
-        result = await session.execute(
-            select(User)
-            .options(
-                selectinload(User.slots).selectinload(Slot.skill),
-                selectinload(User.slots).selectinload(Slot.disease)
-            )
-            .where(User.tg_username == username)
-        )
-        user = result.scalar_one_or_none()
+        user = await get_user_from_telegram(session, telegram_id, username)
+        await session.commit()
 
         if not user:
             await callback_query.answer("Вы не зарегистрированы.", show_alert=True)
@@ -789,21 +778,13 @@ async def command_infection_handler(message: Message) -> None:
         await message.answer("Для работы с ботом у вас должен быть установлен <b>@username</b> в Telegram.")
         return
 
+    telegram_id = message.from_user.id
     async with async_session() as session:
-        result = await session.execute(
-            select(User)
-            .options(
-                selectinload(User.slots).selectinload(Slot.skill),
-                selectinload(User.slots).selectinload(Slot.disease)
-            )
-            .where(User.tg_username == username)
-        )
-        user = result.scalar_one_or_none()
-
+        user = await get_user_from_telegram(session, telegram_id, username)
         if not user:
             await message.answer("Вы не подключены к системе (ваш username не найден в базе).")
             return
-
+        await session.commit()
         if not user.is_alive:
             await message.answer("Ваш персонаж уже мёртв.")
             return
@@ -839,13 +820,9 @@ async def command_night_toggle_handler(message: Message) -> None:
         await message.answer("Нет @username.")
         return
 
+    telegram_id = message.from_user.id
     async with async_session() as session:
-        result = await session.execute(
-            select(User)
-            .options(selectinload(User.slots).selectinload(Slot.skill))
-            .where(User.tg_username == username)
-        )
-        user = result.scalar_one_or_none()
+        user = await get_user_from_telegram(session, telegram_id, username)
         if not user or not user.is_admin:
             await message.answer("Команда только для администраторов.")
             return
@@ -878,13 +855,10 @@ async def craft_start_handler(message: Message, state: FSMContext) -> None:
         await message.answer("Для работы с ботом нужен @username.")
         return
 
+    telegram_id = message.from_user.id
     async with async_session() as session:
-        result = await session.execute(
-            select(User)
-            .options(selectinload(User.slots).selectinload(Slot.skill))
-            .where(User.tg_username == username)
-        )
-        user = result.scalar_one_or_none()
+        user = await get_user_from_telegram(session, telegram_id, username)
+        await session.commit()
 
     if not user:
         await message.answer("Вы не подключены к системе.")
@@ -905,13 +879,9 @@ async def craft_use_alchemy_handler(message: Message, state: FSMContext) -> None
     await state.update_data(use_alchemy_table=use_table)
 
     username = (await state.get_data()).get("craft_username")
+    telegram_id = message.from_user.id if message.from_user else None
     async with async_session() as session:
-        result = await session.execute(
-            select(User)
-            .options(selectinload(User.slots).selectinload(Slot.skill))
-            .where(User.tg_username == username)
-        )
-        user = result.scalar_one_or_none()
+        user = await get_user_from_telegram(session, telegram_id, username)
 
     if not user:
         await state.clear()
@@ -1040,12 +1010,7 @@ async def craft_ingredient2_handler(callback: CallbackQuery, state: FSMContext) 
 
         extra_code = None
         if craft_username:
-            user_result = await session.execute(
-                select(User)
-                .options(selectinload(User.slots).selectinload(Slot.skill))
-                .where(User.tg_username == craft_username)
-            )
-            user = user_result.scalar_one_or_none()
+            user = await get_user_from_telegram(session, callback.from_user.id if callback.from_user else None, craft_username)
             if user and (code is not None or med_type == MedType.SPECIAL):
                 skills = _user_active_skill_names(user)
                 if "Менху" in skills or "Степной знахарь" in skills:
@@ -1103,15 +1068,7 @@ async def treat_target_handler(message: Message, state: FSMContext) -> None:
     target_username = initiator_username if text == "себя" else text
 
     async with async_session() as session:
-        result = await session.execute(
-            select(User)
-            .options(
-                selectinload(User.slots).selectinload(Slot.skill),
-                selectinload(User.slots).selectinload(Slot.disease)
-            )
-            .where(User.tg_username == target_username)
-        )
-        patient = result.scalar_one_or_none()
+        patient = await get_user_from_telegram(session, None, target_username)
 
     if not patient:
         await message.answer("Игрок с таким username не найден.")
@@ -1190,15 +1147,7 @@ async def _treat_finalize(message: Message, state: FSMContext) -> None:
             await message.answer("Лекарства не найдены.")
             return
 
-        result = await session.execute(
-            select(User)
-            .options(
-                selectinload(User.slots).selectinload(Slot.skill),
-                selectinload(User.slots).selectinload(Slot.disease)
-            )
-            .where(User.tg_username == target_username)
-        )
-        patient = result.scalar_one_or_none()
+        patient = await get_user_from_telegram(session, None, target_username)
         if not patient:
             await message.answer("Пациент не найден.")
             return
@@ -1313,6 +1262,10 @@ async def _treat_finalize(message: Message, state: FSMContext) -> None:
 
 
 async def main() -> None:
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        logging.error("BOT_TOKEN не задан или равен заглушке. Проверьте .env и переменные окружения.")
+        return
+
     # Логирование действий пользователей в stdout
     if not user_actions_logger.handlers:
         handler = logging.StreamHandler(sys.stdout)
@@ -1325,7 +1278,7 @@ async def main() -> None:
 
     dp.update.outer_middleware(UserActionLoggingMiddleware())
 
-    # Запуск бота
+    logging.info("Запуск TG-бота (token: %s...)", BOT_TOKEN[:15] if len(BOT_TOKEN) > 15 else "***")
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await dp.start_polling(bot)
 
