@@ -1000,6 +1000,11 @@ async def vk_treat_target_next(message: Message, target_username: str):
     if not patient:
         await message.answer("Игрок с таким именем не найден.")
         return
+    if not patient.is_alive:
+        get_fsm(peer_id)["state"] = None
+        get_fsm(peer_id)["data"] = {}
+        await message.answer("Невозможно провести лечение: игрок мёртв.")
+        return
     if patient.infection_status != InfectionStatus.INFECTED:
         get_fsm(peer_id)["state"] = None
         await message.answer("Невозможно провести лечение: у игрока нет статуса «Заражён».")
@@ -1044,6 +1049,11 @@ async def vk_special_treat_target_next(message: Message, target_username: str):
 
     if not patient:
         await message.answer("Игрок с таким именем не найден.")
+        return
+    if not patient.is_alive:
+        get_fsm(peer_id)["state"] = None
+        get_fsm(peer_id)["data"] = {}
+        await message.answer("Невозможно провести лечение: игрок мёртв.")
         return
 
     if patient.last_cure_time:
@@ -1106,6 +1116,9 @@ async def vk_special_treat_code_next(message: Message, raw_code: str):
         patient = patient_result.scalar_one_or_none()
         if not patient:
             await message.answer("Игрок не найден.")
+            return
+        if not patient.is_alive:
+            await message.answer("Невозможно провести лечение: игрок мёртв.")
             return
 
         # Требование статуса «Заражён» для всех, кроме вакцины на здоровом
@@ -1209,6 +1222,11 @@ async def vk_surgery_target_next(message: Message, target_username: str):
         get_fsm(peer_id)["state"] = None
         get_fsm(peer_id)["data"] = {}
         await message.answer("Игрок с таким именем не найден.")
+        return
+    if not patient.is_alive:
+        get_fsm(peer_id)["state"] = None
+        get_fsm(peer_id)["data"] = {}
+        await message.answer("Невозможно провести операцию: пациент мёртв.")
         return
     has_operable = any(
         s.disease and getattr(s.disease, "operation", False) for s in patient.slots
@@ -1380,6 +1398,9 @@ async def vk_surgery_medicines_next(message: Message, raw: str):
         patient = patient_result.scalar_one_or_none()
         if not patient:
             await message.answer("Пациент не найден.")
+            return
+        if not patient.is_alive:
+            await message.answer("Невозможно провести операцию: пациент мёртв.")
             return
         msgs, patient_died = await _do_surgery_finalize(
             session, patient, immunics_count, antibiotics_count, painkillers_count, location

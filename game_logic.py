@@ -240,6 +240,8 @@ async def do_treat_finalize(session, target_username: str, medicine_codes: list)
     patient = r.scalar_one_or_none()
     if not patient:
         return "Пациент не найден.", False
+    if not patient.is_alive:
+        return "Невозможно провести лечение: игрок мёртв.", False
 
     pain_disease_mod = 0
     cure_mod = 0
