@@ -158,7 +158,13 @@ def _user_has_trauma(user) -> bool:
     """Есть ли у игрока хотя бы одна травма (слот с болезнью типа TRAUMA)."""
     if not getattr(user, "slots", None):
         return False
-    return any(s.disease and s.disease.type == DiseaseType.TRAUMA for s in user.slots)
+    # Нельзя снимать травмы, предназначенные для операции (`operation=True`)
+    return any(
+        s.disease
+        and s.disease.type == DiseaseType.TRAUMA
+        and not getattr(s.disease, "operation", False)
+        for s in user.slots
+    )
 
 
 def _user_has_doctor_skill(user) -> bool:
@@ -211,6 +217,21 @@ def get_trauma_keyboard_vk(traumas: list) -> str:
     for trauma in traumas:
         trauma_code = trauma.trauma_code if trauma.trauma_code is not None else trauma.id
         k.add(Text(f"{trauma.name} (код {trauma_code})", payload={"cmd": f"trauma_{trauma_code}"}))
+        k.row()
+    return k.get_json()
+
+
+def get_cure_trauma_keyboard_vk(traumas: list) -> str:
+    """Клавиатура для «Вылечить травму»: payload не конфликтует с «Получить травму». """
+    k = Keyboard(one_time=True)
+    for trauma in traumas:
+        trauma_code = trauma.trauma_code if trauma.trauma_code is not None else trauma.id
+        k.add(
+            Text(
+                f"{trauma.name} (код {trauma_code})",
+                payload={"cmd": f"cure_trauma_{trauma_code}"},
+            )
+        )
         k.row()
     return k.get_json()
 
@@ -452,6 +473,75 @@ async def vk_payload_handler(message: Message):
         )
         return True
 
+    if payload_cmd.startswith("cure_trauma_"):
+        # Снятие травмы в FSM «Вылечить травму»
+        fsm_state = get_fsm(peer_id).get("state")
+        try:
+            state = fsm_state if isinstance(fsm_state, FsmState) else FsmState(fsm_state)
+        except Exception:
+            state = fsm_state
+        if state != FsmState.CURE_TRAUMA_CODE:
+            return False
+
+        try:
+            trauma_code = int(payload_cmd.replace("cure_trauma_", ""))
+        except ValueError:
+            return False
+
+        # Завершаем FSM перед попыткой (как и в текстовой ветке)
+        get_fsm(peer_id)["state"] = None
+        get_fsm(peer_id)["data"] = {}
+
+        async with async_session() as session:
+            current_user = await get_user_from_vk(session, peer_id, None)
+            if not current_user:
+                await message.answer("Вы не подключены.")
+                return True
+            if not current_user.is_alive:
+                await message.answer("Ваш персонаж уже мёртв.")
+                return True
+
+            slot_with_trauma = None
+            trauma_name = ""
+            for slot in current_user.slots or []:
+                if slot.disease and slot.disease.type == DiseaseType.TRAUMA:
+                    code = (
+                        slot.disease.trauma_code
+                        if slot.disease.trauma_code is not None
+                        else slot.disease.id
+                    )
+                    if code == trauma_code:
+                        if getattr(slot.disease, "operation", False):
+                            await message.answer(
+                                "Эту травму нельзя снять действием «Вылечить травму» — она предназначена для операции."
+                            )
+                            return True
+                        slot_with_trauma = slot
+                        trauma_name = slot.disease.name
+                        break
+
+            if slot_with_trauma is None:
+                await message.answer("У вас нет травмы с таким кодом.")
+                return True
+
+            slot_with_trauma.disease_id = None
+            # Если relationship уже загружен, явно подчистим чтобы кнопки/проверки обновились без refresh
+            try:
+                slot_with_trauma.disease = None
+            except Exception:
+                pass
+            await session.commit()
+
+        night_active = await get_night_active()
+        has_craft = _user_has_medicine_recipe(current_user)
+        has_trauma = _user_has_trauma(current_user)
+        has_doctor = _user_has_doctor_skill(current_user)
+        await message.answer(
+            f"Травма «{trauma_name}» снята.",
+            keyboard=get_main_keyboard_vk(night_active, has_craft, has_trauma, has_doctor),
+        )
+        return True
+
     return False
 
 
@@ -682,9 +772,22 @@ async def vk_cure_trauma_start(message: Message):
     if not current_user:
         await message.answer("Вы не подключены. Напишите /start для привязки.")
         return
+    curable_traumas = [
+        slot.disease
+        for slot in (current_user.slots or [])
+        if slot.disease
+        and slot.disease.type == DiseaseType.TRAUMA
+        and not getattr(slot.disease, "operation", False)
+    ]
+    if not curable_traumas:
+        await message.answer("У вас нет травм, которые можно снять этим действием.")
+        return
     get_fsm(peer_id)["state"] = FsmState.CURE_TRAUMA_CODE
     get_fsm(peer_id)["data"] = {}
-    await message.answer("Введите код травмы (число):")
+    await message.answer(
+        "Выберите травму для снятия по кнопке (или введите код числом):",
+        keyboard=get_cure_trauma_keyboard_vk(curable_traumas),
+    )
 
 
 # ---------- Лечиться (FSM) — регистрируем ДО общего text="<text>", иначе не сработает ----------
@@ -875,6 +978,9 @@ async def vk_fsm_text_handler(message: Message, text: str):
                 if slot.disease and slot.disease.type == DiseaseType.TRAUMA:
                     code = slot.disease.trauma_code if slot.disease.trauma_code is not None else slot.disease.id
                     if code == trauma_code:
+                        if getattr(slot.disease, "operation", False):
+                            await message.answer("Эту травму нельзя снять действием «Вылечить травму» — она предназначена для операции.")
+                            return
                         slot_with_trauma = slot
                         trauma_name = slot.disease.name
                         break
