@@ -61,6 +61,10 @@ class MedType(str, enum.Enum):
     IMMUNIC = "Иммуники"
     PAINKILLER = "Обезболивающие"
     SPECIAL = "Особое"
+    NON_WORKING = "Нерабочее лекарство"
+    POWDER = "Порошочек"
+    PANACEA = "Панацея"
+    VACCINE = "Вакцина"
 
 class IngredientCategory(str, enum.Enum):
     HERB = "Трава"
@@ -145,6 +149,7 @@ class Disease(Base):
     
     light_complication: Mapped[bool] = mapped_column(Boolean, default=False)
     severe_complication: Mapped[bool] = mapped_column(Boolean, default=False)
+    hidden_from_getting: Mapped[bool] = mapped_column(Boolean, default=False)
 
 class Slot(Base):
     __tablename__ = "slots"
@@ -228,6 +233,13 @@ class GameSettings(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     night_active: Mapped[bool] = mapped_column(Boolean, default=False)
     pause_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    pain_disease_mod: Mapped[int] = mapped_column(Integer, default=1)
+    pain_wound_mod: Mapped[int] = mapped_column(Integer, default=3)
+    cure_mod: Mapped[int] = mapped_column(Integer, default=-1)
+    light_comp_mod: Mapped[int] = mapped_column(Integer, default=1)
+    severe_comp_mod: Mapped[int] = mapped_column(Integer, default=1)
+    pain_death_threshold: Mapped[int] = mapped_column(Integer, default=10)
+    pain_consequence_divisor: Mapped[int] = mapped_column(Integer, default=3)
 
 
 class NightPeriod(Base):

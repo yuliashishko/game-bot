@@ -243,8 +243,12 @@ async def do_treat_finalize(session, target_username: str, medicine_codes: list)
     if not patient.is_alive:
         return "Невозможно провести лечение: игрок мёртв.", False
 
-    pain_disease_mod = 0
-    cure_mod = 0
+    gs_result = await session.execute(select(GameSettings).where(GameSettings.id == 1))
+    settings = gs_result.scalar_one_or_none()
+    pain_disease_mod = settings.pain_disease_mod if settings else 0
+    cure_mod = settings.cure_mod if settings else 0
+    pain_death_threshold = settings.pain_death_threshold if settings else PAIN_DEATH_THRESHOLD
+    pain_consequence_divisor = settings.pain_consequence_divisor if settings else PAIN_CONSEQUENCE_DIVISOR
     pain_sum = 0
     for s in patient.slots:
         if s.skill and s.disease_id is None:
@@ -255,7 +259,7 @@ async def do_treat_finalize(session, target_username: str, medicine_codes: list)
         pain_sum += m.pain or 0
     pain_sum += pain_disease_mod
 
-    if pain_sum > PAIN_DEATH_THRESHOLD:
+    if pain_sum > pain_death_threshold:
         patient.is_alive = False
         await session.commit()
         return (
@@ -324,7 +328,7 @@ async def do_treat_finalize(session, target_username: str, medicine_codes: list)
             removed_symptom_names.append(disease.name)
             subtract_cure(layer, strength)
 
-    n_consequences = pain_sum // PAIN_CONSEQUENCE_DIVISOR
+    n_consequences = pain_sum // max(1, pain_consequence_divisor)
     comp_result = await session.execute(
         select(Complication).where(Complication.source_type == ComplicationSource.DISEASE)
     )

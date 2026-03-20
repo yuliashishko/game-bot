@@ -39,8 +39,6 @@ from database import (
 )
 from game_logic import (
     CURE_COOLDOWN_HOURS,
-    PAIN_DEATH_THRESHOLD,
-    PAIN_CONSEQUENCE_DIVISOR,
     _user_active_skill_names,
     _resolve_location,
     _apply_trauma,
@@ -54,6 +52,22 @@ if not VK_TOKEN:
     raise RuntimeError("VK_TOKEN не задан в .env")
 
 bot = Bot(token=VK_TOKEN)
+
+SPECIAL_MED_TYPES = {
+    MedType.SPECIAL,
+    MedType.NON_WORKING,
+    MedType.POWDER,
+    MedType.PANACEA,
+    MedType.VACCINE,
+}
+
+SPECIAL_MEDICINE_KIND_BY_TYPE = {
+    MedType.PANACEA: "Панацея",
+    MedType.VACCINE: "Вакцина",
+    MedType.POWDER: "Порошочек",
+    MedType.NON_WORKING: "Нерабочее лекарство",
+    MedType.SPECIAL: "Особое",
+}
 
 # FSM: peer_id -> {"state": FsmState | None, "data": dict}
 vk_fsm: dict[int, dict[str, Any]] = {}
@@ -503,17 +517,16 @@ async def vk_payload_handler(message: Message):
                 return True
             chosen_slot = random.choice(available_health_slots)
             disease_result = await session.execute(
-                select(Disease).where(Disease.type == DiseaseType.WOUND, Disease.kind == wound_kind)
+                select(Disease).where(
+                    Disease.type == DiseaseType.WOUND,
+                    Disease.kind == wound_kind,
+                    Disease.hidden_from_getting == False,
+                )
             )
             wound_disease = disease_result.scalars().first()
             if not wound_disease:
-                wound_disease = Disease(
-                    name=f"{wound_kind.value} рана",
-                    type=DiseaseType.WOUND,
-                    kind=wound_kind,
-                )
-                session.add(wound_disease)
-                await session.flush()
+                await message.answer("Ранение этого типа скрыто от получения.")
+                return True
             chosen_slot.disease_id = wound_disease.id
             remaining_health = len(available_health_slots) - 1
             skill_name = chosen_slot.skill.name if chosen_slot.skill else ""
@@ -651,7 +664,10 @@ async def vk_payload_handler(message: Message):
 async def vk_trauma_start(message: Message):
     async with async_session() as session:
         result = await session.execute(
-            select(Disease).where(Disease.type == DiseaseType.TRAUMA).order_by(Disease.trauma_code)
+            select(Disease).where(
+                Disease.type == DiseaseType.TRAUMA,
+                Disease.hidden_from_getting == False,
+            ).order_by(Disease.trauma_code)
         )
         traumas = list(result.scalars().all())
     if not traumas:
@@ -685,7 +701,7 @@ async def vk_infection_handler(message: Message):
 async def vk_medicines_handler(message: Message):
     async with async_session() as session:
         medicines_result = await session.execute(
-            select(Medicine).where(Medicine.med_type != MedType.SPECIAL).order_by(Medicine.code)
+            select(Medicine).where(Medicine.med_type.notin_(SPECIAL_MED_TYPES)).order_by(Medicine.code)
         )
         medicines = list(medicines_result.scalars().all())
     if not medicines:
@@ -1443,14 +1459,6 @@ async def vk_treat_target_next(message: Message, target_username: str):
     await message.answer("Введите коды использованных лекарств через пробел или запятую (например: 1 2 3).")
 
 
-SPECIAL_MEDICINE_KIND_BY_CODE = {
-    # В БД нет отдельного поля "тип особого лекарства", поэтому фиксируем по коду.
-    41: "Панацея",
-    51: "Вакцина",
-    61: "Порошочек",
-}
-
-
 async def vk_special_treat_target_next(message: Message, target_username: str):
     """Переход: выбрана цель для лечения особым лекарством."""
     from datetime import datetime
@@ -1510,20 +1518,16 @@ async def vk_special_treat_code_next(message: Message, raw_code: str):
         await message.answer("Введите код особого лекарства числом.")
         return
 
-    kind = SPECIAL_MEDICINE_KIND_BY_CODE.get(code)
-    if not kind:
-        await message.answer("Неизвестный код особого лекарства.")
-        return
-
     async with async_session() as session:
         med_result = await session.execute(select(Medicine).where(Medicine.code == code))
         medicine = med_result.scalar_one_or_none()
         if not medicine:
             await message.answer("Лекарство с таким кодом не найдено в базе.")
             return
-        if medicine.med_type != MedType.SPECIAL:
+        if medicine.med_type not in SPECIAL_MED_TYPES:
             await message.answer("Нельзя использовать обычные лекарства в этом действии. Нужен код особого лекарства.")
             return
+        kind = SPECIAL_MEDICINE_KIND_BY_TYPE.get(medicine.med_type, "Особое")
 
         patient_result = await session.execute(
             select(User)
@@ -1678,7 +1682,6 @@ async def _do_surgery_finalize(
     immunics_count: int,
     antibiotics_count: int,
     painkillers_count: int,
-    location,
 ) -> tuple[list[str], bool]:
     """
     Проводит хирургическую операцию: боль, осложнения, снятие болячек с операция=да.
@@ -1686,11 +1689,13 @@ async def _do_surgery_finalize(
     """
     from datetime import datetime
 
-    X = PAIN_DEATH_THRESHOLD  # 10
-    Y = PAIN_CONSEQUENCE_DIVISOR  # 3
-    pain_wound_mod = location.pain_wound_mod if location else 0
-    light_comp_mod = location.light_comp_mod if location else 0
-    severe_comp_mod = location.severe_comp_mod if location else 0
+    settings_result = await session.execute(select(GameSettings).where(GameSettings.id == 1))
+    settings = settings_result.scalar_one_or_none()
+    pain_death_threshold = settings.pain_death_threshold if settings else 10
+    pain_consequence_divisor = settings.pain_consequence_divisor if settings else 3
+    pain_wound_mod = settings.pain_wound_mod if settings else 0
+    light_comp_mod = settings.light_comp_mod if settings else 0
+    severe_comp_mod = settings.severe_comp_mod if settings else 0
 
     # Боль от лекарств: сумма боли по первым N лекарствам каждого типа (по коду)
     medicine_pain = 0
@@ -1717,15 +1722,15 @@ async def _do_surgery_finalize(
 
     heavy_pain = 0
     light_pain = 0
-    if pain_sum > X + Y:
+    if pain_sum > pain_death_threshold + pain_consequence_divisor:
         heavy_pain = 1
         light_pain = 1
-    elif pain_sum > X:
+    elif pain_sum > pain_death_threshold:
         heavy_pain = 1
-    elif pain_sum > Y:
+    elif pain_sum > pain_consequence_divisor:
         light_pain = 1
 
-    if pain_sum > X:
+    if pain_sum > pain_death_threshold:
         patient.is_alive = False
 
     # Лёгкие осложнения: модификатор + активные болячки + лёгкая боль − иммуники, затем гасим антибиотиками
@@ -1809,10 +1814,6 @@ async def vk_surgery_medicines_next(message: Message, raw: str):
     immunics_count, antibiotics_count, painkillers_count = parts[0], parts[1], parts[2]
 
     async with async_session() as session:
-        location_result = await session.execute(
-            select(Location).where(Location.name.ilike("%госпиталь%"))
-        )
-        location = location_result.scalars().first()
         patient_result = await session.execute(
             select(User)
             .options(
@@ -1829,7 +1830,7 @@ async def vk_surgery_medicines_next(message: Message, raw: str):
             await message.answer("Невозможно провести операцию: пациент мёртв.")
             return
         msgs, patient_died = await _do_surgery_finalize(
-            session, patient, immunics_count, antibiotics_count, painkillers_count, location
+            session, patient, immunics_count, antibiotics_count, painkillers_count
         )
         await session.commit()
 
@@ -1863,7 +1864,7 @@ async def vk_treat_medicines_next(message: Message, raw_codes: str):
     if missing_codes:
         await message.answer(f"Не найдены лекарства с кодами: {missing_codes}. Введите коды снова.")
         return
-    if any(m.med_type == MedType.SPECIAL for m in medicines):
+    if any(m.med_type in SPECIAL_MED_TYPES for m in medicines):
         fsm["state"] = None
         await message.answer("Невозможно провести лечение: использовано лекарство вида «Особое».")
         return

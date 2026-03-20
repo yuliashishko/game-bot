@@ -15,10 +15,10 @@ from aiogram import BaseMiddleware
 import random
 from collections import defaultdict
 from datetime import datetime, timedelta
-from sqlalchemy import select, and_, or_
+from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from config import BOT_TOKEN
-from database import async_session, User, Disease, Skill, Slot, DiseaseType, DiseaseKind, InfectionStatus, Location, Medicine, Complication, MedType, ComplicationSource, UserAction, GameSettings, Ingredient, Recipe, IngredientCategory, IngredientName
+from database import async_session, User, Disease, Skill, Slot, DiseaseType, DiseaseKind, InfectionStatus, Location, Medicine, Complication, MedType, ComplicationSource, UserAction, GameSettings
 
 # Инициализация бота и диспетчера
 dp = Dispatcher(storage=MemoryStorage())
@@ -40,48 +40,13 @@ class TreatStates(StatesGroup):
     medicines = State()
 
 
-# Рецепты создания лекарств (если есть у игрока — видна кнопка «Создать лекарство»)
-MEDICINE_RECIPES = {Recipe.CRAFT_IMMUNICS, Recipe.CRAFT_ANTIBIOTICS, Recipe.CRAFT_PAINKILLERS, Recipe.CRAFT_SPECIAL_MEDS}
-RECIPE_TO_MED_TYPE = {
-    Recipe.CRAFT_IMMUNICS: MedType.IMMUNIC,
-    Recipe.CRAFT_ANTIBIOTICS: MedType.ANTIBIOTIC,
-    Recipe.CRAFT_PAINKILLERS: MedType.PAINKILLER,
-    Recipe.CRAFT_SPECIAL_MEDS: MedType.SPECIAL,
+SPECIAL_MED_TYPES = {
+    MedType.SPECIAL,
+    MedType.NON_WORKING,
+    MedType.POWDER,
+    MedType.PANACEA,
+    MedType.VACCINE,
 }
-
-
-class CraftStates(StatesGroup):
-    use_alchemy_table = State()
-    med_type = State()
-    ingredient1 = State()
-    ingredient2 = State()
-
-
-def _user_has_medicine_recipe(user) -> bool:
-    """Есть ли у игрока хотя бы один рецепт создания лекарства (из активных навыков)."""
-    for slot in user.slots or []:
-        if slot.disease_id is not None:
-            continue
-        if not slot.skill or not getattr(slot.skill, "recipes", None):
-            continue
-        for r in slot.skill.recipes:
-            if r in MEDICINE_RECIPES:
-                return True
-    return False
-
-
-def _user_medicine_recipes(user) -> list:
-    """Список рецептов создания лекарств у игрока (без дублей)."""
-    seen = set()
-    out = []
-    for slot in user.slots or []:
-        if slot.disease_id is not None or not slot.skill or not getattr(slot.skill, "recipes", None):
-            continue
-        for r in slot.skill.recipes:
-            if r in MEDICINE_RECIPES and r not in seen:
-                seen.add(r)
-                out.append(r)
-    return out
 
 
 PAIN_DEATH_THRESHOLD = 10
@@ -151,15 +116,13 @@ class UserActionLoggingMiddleware(BaseMiddleware):
             raise
 
 
-def get_main_keyboard(night_visible: bool = False, has_craft_recipe: bool = False) -> ReplyKeyboardMarkup:
-    """Главное меню. Заночевать — при ночи. Создать лекарство — при наличии рецепта."""
+def get_main_keyboard(night_visible: bool = False) -> ReplyKeyboardMarkup:
+    """Главное меню. Заночевать — при ночи."""
     rows = [
         [KeyboardButton(text="👤 Мой профиль")],
         [KeyboardButton(text="🩸 Получить ранение"), KeyboardButton(text="🦴 Получить травму")],
         [KeyboardButton(text="🦠 Получить заражение"), KeyboardButton(text="💊 Лечиться обычными лекарствами")]
     ]
-    if has_craft_recipe:
-        rows.append([KeyboardButton(text="🧪 Создать лекарство")])
     if night_visible:
         rows.append([KeyboardButton(text="🌙 Заночевать")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, persistent=True)
@@ -218,10 +181,9 @@ async def command_start_handler(message: Message) -> None:
         await session.commit()
 
     night_active = await get_night_active()
-    has_craft = _user_has_medicine_recipe(user)
     await message.answer(
         f"Добро пожаловать, <b>@{username}</b>! Ваш профиль успешно активирован.",
-        reply_markup=get_main_keyboard(night_active, has_craft)
+        reply_markup=get_main_keyboard(night_active)
     )
 
 
@@ -297,8 +259,7 @@ async def command_me_handler(message: Message) -> None:
             msg += "Нет активных навыков"
 
         night_active = await get_night_active()
-        has_craft = _user_has_medicine_recipe(user)
-        await message.answer(msg, reply_markup=get_main_keyboard(night_active, has_craft))
+        await message.answer(msg, reply_markup=get_main_keyboard(night_active))
 
 
 # ---------- Заночевать (FSM) ----------
@@ -561,13 +522,16 @@ async def process_wound_callback(callback_query: CallbackQuery) -> None:
 
         # Find or create Disease
         d_res = await session.execute(
-            select(Disease).where(Disease.type == DiseaseType.WOUND, Disease.kind == kind_enum)
+            select(Disease).where(
+                Disease.type == DiseaseType.WOUND,
+                Disease.kind == kind_enum,
+                Disease.hidden_from_getting == False,
+            )
         )
         disease = d_res.scalars().first()
         if not disease:
-            disease = Disease(name=f"{kind_enum.value} рана", type=DiseaseType.WOUND, kind=kind_enum)
-            session.add(disease)
-            await session.flush()
+            await callback_query.answer("Ранение этого типа скрыто от получения.", show_alert=True)
+            return
 
         # Assign disease
         chosen_slot.disease_id = disease.id
@@ -684,7 +648,10 @@ async def command_trauma_handler(message: Message) -> None:
 
     async with async_session() as session:
         result = await session.execute(
-            select(Disease).where(Disease.type == DiseaseType.TRAUMA).order_by(Disease.trauma_code)
+            select(Disease).where(
+                Disease.type == DiseaseType.TRAUMA,
+                Disease.hidden_from_getting == False,
+            ).order_by(Disease.trauma_code)
         )
         traumas = list(result.scalars().all())
 
@@ -800,7 +767,7 @@ async def command_medicines_handler(message: Message) -> None:
     """Выводит коды и виды лекарств для лечения."""
     async with async_session() as session:
         result = await session.execute(
-            select(Medicine).where(Medicine.med_type != MedType.SPECIAL).order_by(Medicine.code)
+            select(Medicine).where(Medicine.med_type.notin_(SPECIAL_MED_TYPES)).order_by(Medicine.code)
         )
         medicines = list(result.scalars().all())
     if not medicines:
@@ -837,192 +804,11 @@ async def command_night_toggle_handler(message: Message) -> None:
         await session.commit()
         new_state = settings.night_active
 
-    has_craft = _user_has_medicine_recipe(user)
     status = "включена" if new_state else "выключена"
     await message.answer(
         f"🌙 Ночь <b>{status}</b>. Кнопка «Заночевать» теперь {'видна' if new_state else 'скрыта'} у всех игроков.",
-        reply_markup=get_main_keyboard(new_state, has_craft)
+        reply_markup=get_main_keyboard(new_state)
     )
-
-
-# ---------- Создать лекарство (FSM) ----------
-
-@dp.message(F.text == "🧪 Создать лекарство")
-@dp.message(Command("craft"))
-async def craft_start_handler(message: Message, state: FSMContext) -> None:
-    username = message.from_user.username
-    if not username:
-        await message.answer("Для работы с ботом нужен @username.")
-        return
-
-    telegram_id = message.from_user.id
-    async with async_session() as session:
-        user = await get_user_from_telegram(session, telegram_id, username)
-        await session.commit()
-
-    if not user:
-        await message.answer("Вы не подключены к системе.")
-        return
-    if not _user_has_medicine_recipe(user):
-        await message.answer("У вас нет рецептов создания лекарств.")
-        return
-
-    await state.set_state(CraftStates.use_alchemy_table)
-    await state.update_data(craft_username=username)
-    await message.answer("Используете алхимический стол? (да / нет)")
-
-
-@dp.message(StateFilter(CraftStates.use_alchemy_table), F.text)
-async def craft_use_alchemy_handler(message: Message, state: FSMContext) -> None:
-    text = (message.text or "").strip().lower()
-    use_table = text in ("да", "yes", "1")
-    await state.update_data(use_alchemy_table=use_table)
-
-    username = (await state.get_data()).get("craft_username")
-    telegram_id = message.from_user.id if message.from_user else None
-    async with async_session() as session:
-        user = await get_user_from_telegram(session, telegram_id, username)
-
-    if not user:
-        await state.clear()
-        await message.answer("Ошибка: пользователь не найден.")
-        return
-
-    recipes = _user_medicine_recipes(user)
-    if not recipes:
-        await state.clear()
-        await message.answer("Нет доступных рецептов.")
-        return
-
-    await state.set_state(CraftStates.med_type)
-    buttons = []
-    for r in recipes:
-        med_type = RECIPE_TO_MED_TYPE.get(r)
-        if med_type:
-            buttons.append([InlineKeyboardButton(text=med_type.value, callback_data=f"craft_med_{med_type.name}")])
-    await message.answer("Выберите тип лекарства:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-
-
-@dp.callback_query(StateFilter(CraftStates.med_type), lambda c: c.data and c.data.startswith("craft_med_"))
-async def craft_med_type_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    med_name = callback.data.replace("craft_med_", "")
-    try:
-        med_type = MedType[med_name]
-    except KeyError:
-        await callback.answer("Неверный тип.")
-        return
-
-    await state.update_data(craft_med_type=med_name)
-    await state.set_state(CraftStates.ingredient1)
-
-    async with async_session() as session:
-        if med_type == MedType.SPECIAL:
-            result = await session.execute(select(Ingredient).where(Ingredient.name == IngredientName.OTHER))
-        else:
-            result = await session.execute(select(Ingredient).where(Ingredient.category == IngredientCategory.HERB))
-        ingredients = list(result.scalars().all())
-
-    if not ingredients:
-        await callback.message.answer("В базе нет подходящих ингредиентов для первого компонента.")
-        await state.clear()
-        await callback.answer()
-        return
-
-    buttons = [[InlineKeyboardButton(text=ing.name.value, callback_data=f"craft_ing1_{ing.id}")] for ing in ingredients]
-    await callback.message.edit_text("Выберите первый компонент:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    await callback.answer()
-
-
-@dp.callback_query(StateFilter(CraftStates.ingredient1), lambda c: c.data and c.data.startswith("craft_ing1_"))
-async def craft_ingredient1_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    try:
-        ing1_id = int(callback.data.replace("craft_ing1_", ""))
-    except ValueError:
-        await callback.answer("Ошибка.")
-        return
-
-    await state.update_data(craft_ing1_id=ing1_id)
-    await state.set_state(CraftStates.ingredient2)
-    data = await state.get_data()
-    med_name = data.get("craft_med_type", "IMMUNIC")
-    med_type = MedType[med_name] if med_name else MedType.IMMUNIC
-
-    async with async_session() as session:
-        if med_type == MedType.SPECIAL:
-            result = await session.execute(select(Ingredient).where(Ingredient.name == IngredientName.OTHER))
-        elif med_type == MedType.IMMUNIC:
-            result = await session.execute(select(Ingredient).where(Ingredient.category == IngredientCategory.HERB))
-        elif med_type == MedType.ANTIBIOTIC:
-            result = await session.execute(select(Ingredient).where(Ingredient.category == IngredientCategory.ORGAN))
-        elif med_type == MedType.PAINKILLER:
-            result = await session.execute(select(Ingredient).where(Ingredient.name == IngredientName.BLOOD))
-        else:
-            result = await session.execute(select(Ingredient))
-        ingredients = list(result.scalars().all())
-
-    if not ingredients:
-        await callback.message.answer("В базе нет подходящих ингредиентов для второго компонента.")
-        await state.clear()
-        await callback.answer()
-        return
-
-    buttons = [[InlineKeyboardButton(text=ing.name.value, callback_data=f"craft_ing2_{ing.id}")] for ing in ingredients]
-    await callback.message.edit_text("Выберите второй компонент:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    await callback.answer()
-
-
-@dp.callback_query(StateFilter(CraftStates.ingredient2), lambda c: c.data and c.data.startswith("craft_ing2_"))
-async def craft_ingredient2_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    try:
-        ing2_id = int(callback.data.replace("craft_ing2_", ""))
-    except ValueError:
-        await callback.answer("Ошибка.")
-        return
-
-    data = await state.get_data()
-    ing1_id = data.get("craft_ing1_id")
-    med_name = data.get("craft_med_type", "IMMUNIC")
-    med_type = MedType[med_name] if med_name else MedType.IMMUNIC
-    craft_username = data.get("craft_username")
-    await state.clear()
-
-    async with async_session() as session:
-        result = await session.execute(
-            select(Medicine).where(
-                Medicine.med_type == med_type,
-                or_(
-                    and_(Medicine.ingredient1_id == ing1_id, Medicine.ingredient2_id == ing2_id),
-                    and_(Medicine.ingredient1_id == ing2_id, Medicine.ingredient2_id == ing1_id),
-                )
-            )
-        )
-        medicine = result.scalar_one_or_none()
-
-        if medicine:
-            code = medicine.code if medicine.code is not None else medicine.id
-            codes_msg = f"Код лекарства: <b>{code}</b>"
-        elif med_type == MedType.SPECIAL:
-            codes_msg = 'Код лекарства: <b>Хуйня</b> (несуществующий состав)'
-            code = None
-        else:
-            codes_msg = "Лекарство с таким составом не найдено в базе."
-            code = None
-
-        extra_code = None
-        if craft_username:
-            user = await get_user_from_telegram(session, callback.from_user.id if callback.from_user else None, craft_username)
-            if user and (code is not None or med_type == MedType.SPECIAL):
-                skills = _user_active_skill_names(user)
-                if "Менху" in skills or "Степной знахарь" in skills:
-                    same_type = await session.execute(select(Medicine).where(Medicine.med_type == med_type))
-                    same_list = list(same_type.scalars().all())
-                    if same_list:
-                        extra = random.choice(same_list)
-                        extra_code = extra.code if extra.code is not None else extra.id
-                        codes_msg += f"\nДополнительный код (навык): <b>{extra_code}</b>"
-
-    await callback.message.edit_text(codes_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
-    await callback.answer()
 
 
 # ---------- Лечиться обычными лекарствами (FSM) ----------
@@ -1118,7 +904,7 @@ async def treat_medicines_handler(message: Message, state: FSMContext) -> None:
         await message.answer(f"Не найдены лекарства с кодами: {missing}. Введите коды снова.")
         return
 
-    if any(m.med_type == MedType.SPECIAL for m in medicines):
+    if any(m.med_type in SPECIAL_MED_TYPES for m in medicines):
         await state.clear()
         await message.answer("Невозможно провести лечение: использовано лекарство вида «Особое».")
         return
@@ -1135,10 +921,14 @@ async def _treat_finalize(message: Message, state: FSMContext) -> None:
     initiator_chat_id = data.get("initiator_chat_id", message.chat.id)
     await state.clear()
 
-    pain_disease_mod = 0
-    cure_mod = 0
-
     async with async_session() as session:
+        gs_result = await session.execute(select(GameSettings).where(GameSettings.id == 1))
+        settings = gs_result.scalar_one_or_none()
+        pain_disease_mod = settings.pain_disease_mod if settings else 0
+        cure_mod = settings.cure_mod if settings else 0
+        pain_death_threshold = settings.pain_death_threshold if settings else PAIN_DEATH_THRESHOLD
+        pain_consequence_divisor = settings.pain_consequence_divisor if settings else PAIN_CONSEQUENCE_DIVISOR
+
         distinct_codes = sorted(set(medicine_codes))
         result = await session.execute(select(Medicine).where(Medicine.code.in_(distinct_codes)))
         medicines = list(result.scalars().all())
@@ -1173,7 +963,7 @@ async def _treat_finalize(message: Message, state: FSMContext) -> None:
             pain_sum += m.pain or 0
         pain_sum += pain_disease_mod
 
-        if pain_sum > PAIN_DEATH_THRESHOLD:
+        if pain_sum > pain_death_threshold:
             patient.is_alive = False
             await session.commit()
             await message.answer(
@@ -1239,7 +1029,7 @@ async def _treat_finalize(message: Message, state: FSMContext) -> None:
                 slot.disease_id = None
                 subtract_cure(layer, strength)
 
-        n_consequences = pain_sum // PAIN_CONSEQUENCE_DIVISOR
+        n_consequences = pain_sum // max(1, pain_consequence_divisor)
         comp_result = await session.execute(
             select(Complication).where(Complication.source_type == ComplicationSource.DISEASE)
         )

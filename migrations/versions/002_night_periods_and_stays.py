@@ -1,7 +1,7 @@
 """Добавить хранение периодов ночи и фактов ночёвки.
 
-Revision ID: 009_night_periods_and_stays
-Revises: 008_diseases_description
+Revision ID: 002_night_periods_and_stays
+Revises: 0a483c192000
 Create Date: 2026-03-20
 """
 
@@ -9,8 +9,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "009_night_periods_and_stays"
-down_revision = "008_diseases_description"
+revision = "002_night_periods_and_stays"
+down_revision = "0a483c192000"
 branch_labels = None
 depends_on = None
 

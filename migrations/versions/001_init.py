@@ -32,6 +32,7 @@ def upgrade() -> None:
         'diseases',
         sa.Column('id', sa.Integer(), nullable=False),
         sa.Column('name', sa.String(), nullable=False),
+        sa.Column('description', sa.String(), nullable=False, server_default=''),
         sa.Column('type', sa.Enum('WOUND', 'TRAUMA', 'SYMPTOM', name='diseasetype'), nullable=False),
         sa.Column('trauma_code', sa.Integer(), nullable=True),
         sa.Column('operation', sa.Boolean(), nullable=False),
@@ -43,6 +44,7 @@ def upgrade() -> None:
         sa.Column('pain', sa.Integer(), nullable=False),
         sa.Column('light_complication', sa.Boolean(), nullable=False),
         sa.Column('severe_complication', sa.Boolean(), nullable=False),
+        sa.Column('hidden_from_getting', sa.Boolean(), nullable=False, server_default='false'),
         sa.PrimaryKeyConstraint('id')
     )
     op.create_table(
@@ -101,7 +103,7 @@ def upgrade() -> None:
         'medicines',
         sa.Column('id', sa.Integer(), nullable=False),
         sa.Column('code', sa.Integer(), nullable=True),
-        sa.Column('med_type', sa.Enum('ANTIBIOTIC', 'IMMUNIC', 'PAINKILLER', 'SPECIAL', name='medtype'), nullable=False),
+        sa.Column('med_type', sa.Enum('ANTIBIOTIC', 'IMMUNIC', 'PAINKILLER', 'SPECIAL', 'NON_WORKING', 'POWDER', 'PANACEA', 'VACCINE', name='medtype'), nullable=False),
         sa.Column('cure_layer_1', sa.Integer(), nullable=False),
         sa.Column('cure_layer_2', sa.Integer(), nullable=False),
         sa.Column('cure_layer_3', sa.Integer(), nullable=False),
@@ -139,6 +141,14 @@ def upgrade() -> None:
         'game_settings',
         sa.Column('id', sa.Integer(), nullable=False),
         sa.Column('night_active', sa.Boolean(), nullable=False),
+        sa.Column('pause_active', sa.Boolean(), nullable=False, server_default='false'),
+        sa.Column('pain_disease_mod', sa.Integer(), nullable=False, server_default='1'),
+        sa.Column('pain_wound_mod', sa.Integer(), nullable=False, server_default='3'),
+        sa.Column('cure_mod', sa.Integer(), nullable=False, server_default='-1'),
+        sa.Column('light_comp_mod', sa.Integer(), nullable=False, server_default='1'),
+        sa.Column('severe_comp_mod', sa.Integer(), nullable=False, server_default='1'),
+        sa.Column('pain_death_threshold', sa.Integer(), nullable=False, server_default='10'),
+        sa.Column('pain_consequence_divisor', sa.Integer(), nullable=False, server_default='3'),
         sa.PrimaryKeyConstraint('id')
     )
 

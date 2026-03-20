@@ -17,6 +17,7 @@ import json
 import os
 import re
 import sys
+from urllib.parse import urlparse, unquote
 
 # Корень проекта в path для импорта config/database
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -68,6 +69,42 @@ def slot_layer_from_position(position: int) -> int:
     return (position % 3) + 1
 
 
+def parse_bool(raw: str, default: bool = False) -> bool:
+    value = (raw or "").strip().lower()
+    if not value:
+        return default
+    return value in ("1", "true", "yes", "да")
+
+
+def normalize_vk_username(raw: str) -> str | None:
+    """
+    Привести vk_username к short name / idNNN:
+    - https://vk.com/username -> username
+    - vk.com/username -> username
+    - @username -> username
+    - отрезать query/hash и декодировать %xx
+    """
+    value = (raw or "").strip()
+    if not value:
+        return None
+
+    value = value.replace("\\", "/").strip()
+    if value.startswith("@"):
+        value = value[1:].strip()
+
+    if value.startswith("http://") or value.startswith("https://"):
+        parsed = urlparse(value)
+        path = (parsed.path or "").strip("/")
+        value = path or value
+    elif value.lower().startswith("vk.com/"):
+        value = value.split("/", 1)[1].strip()
+
+    # Срезаем query/hash, если остались
+    value = value.split("?", 1)[0].split("#", 1)[0].strip().strip("/")
+    value = unquote(value).strip()
+    return value or None
+
+
 async def run(csv_path: str, replace_existing: bool = True) -> None:
     if not os.path.isfile(csv_path):
         print(f"Файл не найден: {csv_path}", file=sys.stderr)
@@ -93,11 +130,12 @@ async def run(csv_path: str, replace_existing: bool = True) -> None:
                 continue
 
             character_name = (row.get("character_name") or tg_username).strip()
-            vk_username = (row.get("vk_username") or "").strip() or None
-            is_active = (row.get("is_active") or "0").strip() in ("1", "true", "yes", "да")
-            is_admin = (row.get("is_admin") or "0").strip() in ("1", "true", "yes", "да")
-            is_alive = (row.get("is_alive") or "1").strip() not in ("0", "false", "no")
-            is_child = (row.get("is_child") or "0").strip() in ("1", "true", "yes", "да")
+            vk_username = normalize_vk_username(row.get("vk_username") or "")
+            # telegram_id игнорируем, но булевые флаги берём из CSV
+            is_active = parse_bool(row.get("is_active") or "", default=False)
+            is_admin = parse_bool(row.get("is_admin") or "", default=False)
+            is_alive = parse_bool(row.get("is_alive") or "", default=True)
+            is_child = parse_bool(row.get("is_child") or "", default=False)
             weak_zones = parse_weak_zones(row.get("weak_zones") or "")
 
             # Существующий пользователь: обновить или пропустить
@@ -138,6 +176,19 @@ async def run(csv_path: str, replace_existing: bool = True) -> None:
                 key = f"skill_{pos + 1}"
                 skill_name = parse_skill_name(row.get(key) or "")
                 skill_id = skills_by_name.get(skill_name) if skill_name else None
+                if skill_name and skill_id is None:
+                    new_skill = Skill(
+                        name=skill_name,
+                        description="",
+                        is_health=False,
+                        pain=0,
+                        recipes=[],
+                    )
+                    session.add(new_skill)
+                    await session.flush()
+                    skill_id = new_skill.id
+                    skills_by_name[skill_name] = skill_id
+                    print(f"  Создан новый навык: «{skill_name}»")
                 layer = slot_layer_from_position(pos)
                 slot = Slot(
                     user_id=user.id,
@@ -147,8 +198,6 @@ async def run(csv_path: str, replace_existing: bool = True) -> None:
                     disease_id=None,
                 )
                 session.add(slot)
-                if skill_name and skill_id is None:
-                    print(f"  Предупреждение: навык «{skill_name}» не найден в БД (tg_username={tg_username})", file=sys.stderr)
 
         await session.commit()
     print(f"Импортировано игроков: {len(rows)}")
@@ -159,8 +208,12 @@ def main() -> None:
     parser.add_argument(
         "csv_path",
         nargs="?",
-        default=os.path.join(os.path.dirname(os.path.dirname(__file__)), "players_import.csv"),
-        help="Путь к CSV (по умолчанию: players_import.csv в корне проекта)",
+        default=os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "import_data",
+            "Стартовый бот - Игроки.csv",
+        ),
+        help="Путь к CSV (по умолчанию: import_data/Стартовый бот - Игроки.csv)",
     )
     parser.add_argument(
         "--no-replace",
