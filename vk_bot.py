@@ -273,12 +273,24 @@ def get_main_keyboard_vk(
     return k.get_json()
 
 
-def get_wound_keyboard_vk() -> str:
+async def get_wound_keyboard_vk() -> str | None:
+    async with async_session() as session:
+        result = await session.execute(
+            select(Disease).where(
+                Disease.type == DiseaseType.WOUND,
+                Disease.hidden_from_getting == False,
+            )
+        )
+        wounds = list(result.scalars().all())
+    if not wounds:
+        return None
     k = Keyboard(one_time=True)
-    k.add(Text("Небоевая", payload={"cmd": "wound_NON_COMBAT"}))
-    k.row()
-    k.add(Text("Ножевая", payload={"cmd": "wound_KNIFE"}))
-    k.add(Text("Пулевая", payload={"cmd": "wound_BULLET"}))
+    first = True
+    for disease in wounds:
+        if not first:
+            k.row()
+        first = False
+        k.add(Text(disease.name, payload={"cmd": f"wound_id_{disease.id}"}))
     return k.get_json()
 
 
@@ -298,7 +310,7 @@ def get_trauma_keyboard_vk(traumas: list) -> str:
     k = Keyboard(one_time=True)
     for trauma in traumas:
         trauma_code = trauma.trauma_code if trauma.trauma_code is not None else trauma.id
-        k.add(Text(f"{trauma.name} (код {trauma_code})", payload={"cmd": f"trauma_{trauma_code}"}))
+        k.add(Text(trauma.name, payload={"cmd": f"trauma_{trauma_code}"}))
         k.row()
     return k.get_json()
 
@@ -310,7 +322,7 @@ def get_cure_trauma_keyboard_vk(traumas: list) -> str:
         trauma_code = trauma.trauma_code if trauma.trauma_code is not None else trauma.id
         k.add(
             Text(
-                f"{trauma.name} (код {trauma_code})",
+                trauma.name,
                 payload={"cmd": f"cure_trauma_{trauma_code}"},
             )
         )
@@ -408,7 +420,8 @@ async def vk_me_handler(message: Message):
                 if not is_blocked:
                     health_current += 1
             elif not is_blocked:
-                skills.append(slot.skill.name)
+                if (slot.skill.name or "").strip().lower() != "здоровье":
+                    skills.append(slot.skill.name)
                 for recipe in (slot.skill.recipes or []):
                     recipe_name = recipe.value if hasattr(recipe, "value") else str(recipe)
                     if recipe_name not in recipes:
@@ -447,14 +460,14 @@ async def vk_profile_details_handler(message: Message):
     symptoms: list[str] = []
     skills: list[str] = []
 
-    def _disease_details_text(disease) -> str:
+    def _disease_line(disease) -> str:
         description = (getattr(disease, "description", "") or "").strip()
-        return description or "Описание отсутствует."
+        return f"• {disease.name} — {description}" if description else f"• {disease.name}"
 
     for slot in current_user.slots or []:
         if slot.disease:
             disease = slot.disease
-            disease_line = f"• {disease.name} — {_disease_details_text(disease)}"
+            disease_line = _disease_line(disease)
             match disease.type:
                 case DiseaseType.WOUND:
                     wounds.append(disease_line)
@@ -462,7 +475,7 @@ async def vk_profile_details_handler(message: Message):
                     traumas.append(disease_line)
                 case DiseaseType.SYMPTOM:
                     symptoms.append(disease_line)
-        if slot.skill and slot.disease_id is None:
+        if slot.skill and slot.disease_id is None and (slot.skill.name or "").strip().lower() != "здоровье":
             desc = (slot.skill.description or "").strip()
             skills.append(f"• {slot.skill.name}: {desc}" if desc else f"• {slot.skill.name}")
 
@@ -482,7 +495,11 @@ async def vk_profile_details_handler(message: Message):
 
 @bot.on.message(text="🩸 Получить ранение")
 async def vk_wound_start(message: Message):
-    await message.answer("Выберите тип ранения:", keyboard=get_wound_keyboard_vk())
+    keyboard = await get_wound_keyboard_vk()
+    if not keyboard:
+        await message.answer("Сейчас нет доступных для получения ранений.")
+        return
+    await message.answer("Выберите тип ранения:", keyboard=keyboard)
 
 
 @bot.on.message(HasPayloadRule())
@@ -494,9 +511,11 @@ async def vk_payload_handler(message: Message):
     peer_id = message.peer_id
 
     if payload_cmd.startswith("wound_"):
-        wound_kind_name = payload_cmd.split("_", 1)[1]
-        wound_kind = getattr(DiseaseKind, wound_kind_name, None)
-        if wound_kind is None:
+        if not payload_cmd.startswith("wound_id_"):
+            return False
+        try:
+            disease_id = int(payload_cmd.replace("wound_id_", ""))
+        except ValueError:
             return False
         async with async_session() as session:
             current_user = await get_user_from_vk(session, peer_id, None)
@@ -518,12 +537,12 @@ async def vk_payload_handler(message: Message):
             chosen_slot = random.choice(available_health_slots)
             disease_result = await session.execute(
                 select(Disease).where(
+                    Disease.id == disease_id,
                     Disease.type == DiseaseType.WOUND,
-                    Disease.kind == wound_kind,
                     Disease.hidden_from_getting == False,
                 )
             )
-            wound_disease = disease_result.scalars().first()
+            wound_disease = disease_result.scalar_one_or_none()
             if not wound_disease:
                 await message.answer("Ранение этого типа скрыто от получения.")
                 return True
@@ -673,7 +692,7 @@ async def vk_trauma_start(message: Message):
     if not traumas:
         await message.answer("В базе нет травм.")
         return
-    await message.answer("Выберите травму по коду:", keyboard=get_trauma_keyboard_vk(traumas))
+    await message.answer("Выберите травму:", keyboard=get_trauma_keyboard_vk(traumas))
 
 
 # ---------- Заражение ----------

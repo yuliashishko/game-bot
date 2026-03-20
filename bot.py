@@ -234,7 +234,7 @@ async def command_me_handler(message: Message) -> None:
                     if not is_blocked:
                         health_current += 1
                 else:
-                    if not is_blocked:
+                    if not is_blocked and (s.name or "").strip().lower() != "здоровье":
                         skills.append(s.name)
 
         # Собираем финальное сообщение
@@ -470,12 +470,20 @@ async def _night_finalize(message: Message, state: FSMContext) -> None:
     await message.answer(msg)
 
 
-def get_wound_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Небоевая", callback_data="wound_NON_COMBAT")],
-        [InlineKeyboardButton(text="Ножевая", callback_data="wound_KNIFE")],
-        [InlineKeyboardButton(text="Пулевая", callback_data="wound_BULLET")]
-    ])
+async def get_wound_keyboard() -> InlineKeyboardMarkup:
+    async with async_session() as session:
+        result = await session.execute(
+            select(Disease).where(
+                Disease.type == DiseaseType.WOUND,
+                Disease.hidden_from_getting == False,
+            )
+        )
+        wounds = list(result.scalars().all())
+    rows = [
+        [InlineKeyboardButton(text=d.name, callback_data=f"wound_id_{d.id}")]
+        for d in wounds
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 @dp.message(F.text == "🩸 Получить ранение")
 @dp.message(Command("wound"))
@@ -483,12 +491,22 @@ async def command_wound_handler(message: Message) -> None:
     """
     Позволяет игроку получить ранение. Выводит кнопки с выбором типа ранения.
     """
-    await message.answer("Выберите тип ранения:", reply_markup=get_wound_keyboard())
+    keyboard = await get_wound_keyboard()
+    if not keyboard.inline_keyboard:
+        await message.answer("Сейчас нет доступных для получения ранений.")
+        return
+    await message.answer("Выберите тип ранения:", reply_markup=keyboard)
 
 @dp.callback_query(lambda c: c.data and c.data.startswith('wound_'))
 async def process_wound_callback(callback_query: CallbackQuery) -> None:
-    kind_str = callback_query.data.split('_', 1)[1] # NON_COMBAT, KNIFE, BULLET
-    kind_enum = getattr(DiseaseKind, kind_str)
+    if not callback_query.data.startswith("wound_id_"):
+        await callback_query.answer("Неверный формат выбора ранения.", show_alert=True)
+        return
+    try:
+        disease_id = int(callback_query.data.replace("wound_id_", ""))
+    except ValueError:
+        await callback_query.answer("Неверный код ранения.", show_alert=True)
+        return
     
     username = callback_query.from_user.username
     if not username:
@@ -523,12 +541,12 @@ async def process_wound_callback(callback_query: CallbackQuery) -> None:
         # Find or create Disease
         d_res = await session.execute(
             select(Disease).where(
+                Disease.id == disease_id,
                 Disease.type == DiseaseType.WOUND,
-                Disease.kind == kind_enum,
                 Disease.hidden_from_getting == False,
             )
         )
-        disease = d_res.scalars().first()
+        disease = d_res.scalar_one_or_none()
         if not disease:
             await callback_query.answer("Ранение этого типа скрыто от получения.", show_alert=True)
             return
@@ -633,8 +651,7 @@ def get_trauma_keyboard(traumas):
     rows = []
     for d in traumas:
         code = d.trauma_code if d.trauma_code is not None else d.id
-        label = f"{d.name} (код {code})"
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"trauma_{code}")])
+        rows.append([InlineKeyboardButton(text=d.name, callback_data=f"trauma_{code}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -657,11 +674,11 @@ async def command_trauma_handler(message: Message) -> None:
 
     if not traumas:
         await message.answer(
-            "В базе нет травм. Введите код травмы числом или добавьте травмы в БД."
+            "В базе нет доступных травм. Добавьте травмы в БД."
         )
         return
 
-    await message.answer("Выберите травму по коду:", reply_markup=get_trauma_keyboard(traumas))
+    await message.answer("Выберите травму:", reply_markup=get_trauma_keyboard(traumas))
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("trauma_"))

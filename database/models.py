@@ -124,7 +124,7 @@ class Skill(Base):
     __tablename__ = "skills"
     
     id: Mapped[int] = mapped_column(primary_key=True)
-    name: Mapped[str] = mapped_column(String, unique=True)
+    name: Mapped[str] = mapped_column(String)
     description: Mapped[str] = mapped_column(String)
     is_health: Mapped[bool] = mapped_column(Boolean, default=False)
     pain: Mapped[int] = mapped_column(Integer, default=0)

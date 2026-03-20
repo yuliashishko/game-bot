@@ -71,8 +71,7 @@ def upgrade() -> None:
         sa.Column('is_health', sa.Boolean(), nullable=False),
         sa.Column('pain', sa.Integer(), nullable=False),
         sa.Column('recipes', postgresql.ARRAY(sa.Enum('REPAIR_CLOAK', 'REPAIR_BOOTS', 'REPAIR_GLOVES', 'REPAIR_MASKS', 'REPAIR_BANDIT_MASKS', 'REPAIR_KNIVES', 'REPAIR_GUNS', 'CRAFT_LOCKPICKS', 'CRAFT_TWYRINE', 'UPGRADE_LOCKS', 'CRAFT_IMMUNICS', 'CRAFT_ANTIBIOTICS', 'CRAFT_PAINKILLERS', 'CRAFT_CLOAKS', 'CRAFT_BOOTS', 'CRAFT_GLOVES', 'CRAFT_MASKS', 'CRAFT_BANDIT_MASKS', 'CRAFT_KNIVES', 'CRAFT_LOCKS', 'REPAIR_ARMY_CLOAKS', 'CRAFT_SPECIAL_MEDS', name='recipe')), nullable=False),
-        sa.PrimaryKeyConstraint('id'),
-        sa.UniqueConstraint('name')
+        sa.PrimaryKeyConstraint('id')
     )
     op.create_table(
         'users',
