@@ -205,12 +205,6 @@ class Location(Base):
     infection_chance: Mapped[int] = mapped_column(Integer, default=0) # 0 - 100
     capacity: Mapped[int] = mapped_column(Integer, default=0)
     quality: Mapped[bool] = mapped_column(Boolean, default=False)
-    
-    pain_disease_mod: Mapped[int] = mapped_column(Integer, default=0)
-    pain_wound_mod: Mapped[int] = mapped_column(Integer, default=0)
-    cure_mod: Mapped[int] = mapped_column(Integer, default=0)
-    light_comp_mod: Mapped[int] = mapped_column(Integer, default=0) # -1, 0, 1
-    severe_comp_mod: Mapped[int] = mapped_column(Integer, default=0) # -1, 0, 1
 
 
 class UserAction(Base):
