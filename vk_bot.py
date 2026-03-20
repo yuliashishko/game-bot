@@ -154,6 +154,27 @@ async def vk_pause_guard(message: Message):
     await message.answer("Бот сейчас на паузе администратором. Команды недоступны.")
 
 
+class DeadPlayerRule(ABCRule[Message]):
+    """Глобальный guard: для мёртвого персонажа доступен только просмотр профиля."""
+
+    async def check(self, message: Message) -> bool:
+        text = (getattr(message, "text", None) or "").strip().lower()
+        # Разрешаем только профиль
+        if text in {"👤 мой профиль", "мой профиль", "/me", "!me", "me"}:
+            return False
+
+        async with async_session() as session:
+            user = await get_user_from_vk(session, message.peer_id, None)
+            if not user:
+                return False
+            return not user.is_alive
+
+
+@bot.on.message(DeadPlayerRule())
+async def vk_dead_player_guard(message: Message):
+    await message.answer("Ваш персонаж мёртв. Доступно только действие «👤 Мой профиль».")
+
+
 def _user_has_trauma(user) -> bool:
     """Есть ли у игрока хотя бы одна травма (слот с болезнью типа TRAUMA)."""
     if not getattr(user, "slots", None):
@@ -331,8 +352,10 @@ async def vk_me_handler(message: Message):
                 skills.append(slot.skill.name)
 
     status_text = current_user.infection_status.value if current_user.infection_status else "Здоров"
+    life_status = "Мёртв" if not current_user.is_alive else "Жив"
     char_name = current_user.character_name or "Неизвестный"
     msg = f"👤 Профиль игрока {char_name}\n\n"
+    msg += f"☠️ Статус персонажа: {life_status}\n"
     msg += f"🦠 Статус инфекции: {status_text}\n"
     msg += f"❤️ Здоровье: {health_current} / {health_max}\n"
     msg += f"🩸 Ран: {wounds}\n\n"
