@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sqlalchemy import select, delete
 from database import async_session
-from database.models import User, Slot, Skill, WeakZone, InfectionStatus
+from database.models import User, Slot, Skill, WeakZone, InfectionStatus, Recipe
 
 
 def parse_weak_zones(raw: str) -> list:
@@ -47,22 +47,81 @@ def parse_weak_zones(raw: str) -> list:
     return result
 
 
-def parse_skill_name(cell: str) -> str | None:
-    """Из ячейки с JSON навыка извлечь name."""
+def _parse_recipe_names(raw: str | None) -> list[str] | None:
+    value = (raw or "").strip()
+    if not value:
+        return []
+    tokens = []
+    for part in value.split(","):
+        token = part.strip().strip('"').strip("'")
+        if token:
+            tokens.append(token)
+    return tokens
+
+
+def _to_recipe_enums(recipe_names: list[str] | None) -> list[Recipe]:
+    if recipe_names is None:
+        return []
+    out: list[Recipe] = []
+    for name in recipe_names:
+        try:
+            out.append(Recipe[name])
+        except KeyError:
+            continue
+    return out
+
+
+def parse_skill_meta(cell: str) -> dict:
+    """Из ячейки с JSON навыка извлечь поля навыка."""
+    meta = {
+        "name": None,
+        "description": None,
+        "is_health": None,
+        "pain": None,
+        "recipes": None,
+    }
     if not cell or not cell.strip():
-        return None
+        return meta
     raw = cell.strip()
     # Убрать лишнюю запятую в конце (часто в экспорте)
     if raw.endswith(","):
         raw = raw[:-1]
     try:
         data = json.loads(raw)
-        return data.get("name") if isinstance(data, dict) else None
+        if isinstance(data, dict):
+            name = data.get("name")
+            description = data.get("description")
+            is_health = data.get("is_health")
+            pain = data.get("pain")
+            recipes = data.get("recipes")
+            meta["name"] = name if isinstance(name, str) else None
+            meta["description"] = description if isinstance(description, str) else None
+            meta["is_health"] = is_health if isinstance(is_health, bool) else None
+            meta["pain"] = pain if isinstance(pain, int) else None
+            if isinstance(recipes, list):
+                meta["recipes"] = [r for r in recipes if isinstance(r, str)]
+            return meta
+        return meta
     except json.JSONDecodeError:
-        # Попробовать вытащить "name": "..." регексом
+        # Фолбэк для строк с невалидным JSON (например recipes: [CRAFT_IMMUNICS]).
         m = re.search(r'"name"\s*:\s*"([^"]+)"', raw)
-        return m.group(1) if m else None
-    return None
+        md = re.search(r'"description"\s*:\s*"([^"]*)"', raw)
+        mh = re.search(r'"is_health"\s*:\s*(true|false)', raw, flags=re.IGNORECASE)
+        mp = re.search(r'"pain"\s*:\s*(-?\d+)', raw)
+        mr = re.search(r'"recipes"\s*:\s*\[([^\]]*)\]', raw)
+        meta["name"] = m.group(1) if m else None
+        meta["description"] = md.group(1) if md else None
+        if mh:
+            meta["is_health"] = mh.group(1).lower() == "true"
+        if mp:
+            try:
+                meta["pain"] = int(mp.group(1))
+            except ValueError:
+                meta["pain"] = None
+        if mr:
+            meta["recipes"] = _parse_recipe_names(mr.group(1))
+        return meta
+    return meta
 
 
 def slot_layer_from_position(position: int) -> int:
@@ -119,10 +178,6 @@ async def run(csv_path: str, replace_existing: bool = True) -> None:
         sys.exit(1)
 
     async with async_session() as session:
-        # Загрузить все навыки по имени
-        result = await session.execute(select(Skill))
-        skills_by_name = {s.name: s.id for s in result.scalars().all()}
-
         for row in rows:
             tg_username = (row.get("tg_username") or "").strip()
             if not tg_username:
@@ -174,27 +229,33 @@ async def run(csv_path: str, replace_existing: bool = True) -> None:
             # Слоты по skill_1..skill_6
             for pos in range(6):
                 key = f"skill_{pos + 1}"
-                skill_name = parse_skill_name(row.get(key) or "")
-                skill_id = skills_by_name.get(skill_name) if skill_name else None
-                if skill_name and skill_id is None:
+                skill_meta = parse_skill_meta(row.get(key) or "")
+                skill_name = skill_meta["name"]
+                skill = None
+                if skill_name:
+                    health_skill = bool(skill_meta["is_health"])
+                    skill_description = skill_meta["description"] or ""
+                    skill_pain = skill_meta["pain"]
+                    if not isinstance(skill_pain, int):
+                        skill_pain = 0
+                    skill_recipes = _to_recipe_enums(skill_meta["recipes"])
                     new_skill = Skill(
                         name=skill_name,
-                        description="",
-                        is_health=False,
-                        pain=0,
-                        recipes=[],
+                        description=skill_description,
+                        is_health=health_skill,
+                        pain=skill_pain,
+                        recipes=skill_recipes,
                     )
                     session.add(new_skill)
                     await session.flush()
-                    skill_id = new_skill.id
-                    skills_by_name[skill_name] = skill_id
+                    skill = new_skill
                     print(f"  Создан новый навык: «{skill_name}»")
                 layer = slot_layer_from_position(pos)
                 slot = Slot(
                     user_id=user.id,
                     position=pos,
                     layer=layer,
-                    skill_id=skill_id,
+                    skill_id=skill.id if skill else None,
                     disease_id=None,
                 )
                 session.add(slot)
