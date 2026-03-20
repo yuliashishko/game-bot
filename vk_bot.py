@@ -84,13 +84,6 @@ class FsmState(str, Enum):
     CRAFT_MED_TYPE = "craft_med_type"
     CRAFT_INGREDIENT1 = "craft_ingredient1"
     CRAFT_INGREDIENT2 = "craft_ingredient2"
-    RESEARCH_CONFIRM_LAB = "research_confirm_lab"
-    RESEARCH_REAGENT_CODE = "research_reagent_code"
-    RESEARCH_OBJECT_TYPE = "research_object_type"
-    RESEARCH_INGREDIENT_NAME = "research_ingredient_name"
-    RESEARCH_BLUE_MARK = "research_blue_mark"
-    RESEARCH_MEDICINE_CODE = "research_medicine_code"
-    RESEARCH_CORPSE_ID = "research_corpse_id"
 
 
 async def get_user_from_vk(session, vk_id: int | None, vk_username: str | None):
@@ -164,7 +157,6 @@ def get_main_keyboard_vk(
     if has_doctor:
         k.row()
         k.add(Text("🏥 Провести хирургическую операцию"))
-        k.add(Text("🔬 Провести исследование"))
     if has_craft_recipe:
         k.row()
         k.add(Text("🧪 Создать лекарство"))
@@ -667,23 +659,6 @@ async def vk_surgery_start(message: Message):
     get_fsm(peer_id)["data"] = {"initiator_peer_id": peer_id}
     await message.answer("Подтверждаете, что находитесь в Госпитале? (да / нет)")
 
-
-@bot.on.message(text="🔬 Провести исследование")
-async def vk_research_start(message: Message):
-    peer_id = message.peer_id
-    async with async_session() as session:
-        current_user = await get_user_from_vk(session, peer_id, None)
-    if not current_user:
-        await message.answer("Вы не подключены. Напишите /start для привязки.")
-        return
-    if not _user_has_doctor_skill(current_user):
-        await message.answer("Действие доступно только персонажам с навыком «Врач».")
-        return
-    get_fsm(peer_id)["state"] = FsmState.RESEARCH_CONFIRM_LAB
-    get_fsm(peer_id)["data"] = {}
-    await message.answer("Подтверждаете работу за лабораторным столом? (да / нет)")
-
-
 # ---------- Создать лекарство (FSM) — регистрируем ДО общего text="<text>", иначе не сработает ----------
 
 @bot.on.message(text="🧪 Создать лекарство")
@@ -930,186 +905,6 @@ async def vk_fsm_text_handler(message: Message, text: str):
         case FsmState.CRAFT_INGREDIENT2:
             await vk_craft_ingredient2_next(message, normalized_text)
             return
-
-        case FsmState.RESEARCH_CONFIRM_LAB:
-            if normalized_text.lower() not in ("да", "yes", "1"):
-                fsm["state"] = None
-                fsm["data"] = {}
-                await message.answer("Действие отменено.")
-                return
-            fsm["state"] = FsmState.RESEARCH_REAGENT_CODE
-            await message.answer("Введите код реагента (число):")
-            return
-
-        case FsmState.RESEARCH_REAGENT_CODE:
-            try:
-                code = int(normalized_text)
-            except ValueError:
-                await message.answer("Введите число — код реагента.")
-                return
-            fsm["data"]["research_reagent_code"] = code
-            fsm["state"] = FsmState.RESEARCH_OBJECT_TYPE
-            await message.answer(
-                "Выберите объект исследования (введите номер или название):\n"
-                "  1. Ингредиент\n  2. Лекарство\n  3. Код трупа"
-            )
-            return
-
-        case FsmState.RESEARCH_OBJECT_TYPE:
-            await vk_research_object_type_next(message, normalized_text)
-            return
-
-        case FsmState.RESEARCH_INGREDIENT_NAME:
-            await vk_research_ingredient_next(message, normalized_text)
-            return
-
-        case FsmState.RESEARCH_BLUE_MARK:
-            await vk_research_blue_mark_next(message, normalized_text)
-            return
-
-        case FsmState.RESEARCH_MEDICINE_CODE:
-            await vk_research_medicine_code_next(message, normalized_text)
-            return
-
-        case FsmState.RESEARCH_CORPSE_ID:
-            await vk_research_corpse_next(message, normalized_text)
-            return
-
-
-async def vk_research_object_type_next(message: Message, normalized_text: str):
-    """Выбор объекта исследования: Ингредиент / Лекарство / Код трупа."""
-    peer_id = message.peer_id
-    fsm = get_fsm(peer_id)
-    t = normalized_text.lower().strip()
-    if t in ("1", "ингредиент"):
-        fsm["state"] = FsmState.RESEARCH_INGREDIENT_NAME
-        async with async_session() as session:
-            r = await session.execute(select(Ingredient).order_by(Ingredient.name))
-            ings = list(r.scalars().all())
-        names = ", ".join(ing.name.value for ing in ings)
-        await message.answer(f"Введите название ингредиента: {names}")
-        return
-    if t in ("2", "лекарство"):
-        fsm["state"] = FsmState.RESEARCH_MEDICINE_CODE
-        await message.answer("Введите код лекарства (число):")
-        return
-    if t in ("3", "код трупа", "труп"):
-        fsm["state"] = FsmState.RESEARCH_CORPSE_ID
-        await message.answer("Введите код трупа или @username пациента:")
-        return
-    await message.answer("Введите 1 (Ингредиент), 2 (Лекарство) или 3 (Код трупа).")
-
-
-async def vk_research_ingredient_next(message: Message, normalized_text: str):
-    """Введено название ингредиента. Если кровь — уточнить синюю метку."""
-    peer_id = message.peer_id
-    fsm = get_fsm(peer_id)
-    async with async_session() as session:
-        r = await session.execute(select(Ingredient).where(Ingredient.name == IngredientName.BLOOD))
-        blood_ing = r.scalar_one_or_none()
-        # поиск по названию (value)
-        r2 = await session.execute(select(Ingredient))
-        all_ings = list(r2.scalars().all())
-    name_lower = normalized_text.lower().strip()
-    chosen = None
-    for ing in all_ings:
-        if (ing.name.value or "").lower() == name_lower:
-            chosen = ing
-            break
-    if not chosen:
-        await message.answer("Ингредиент с таким названием не найден. Введите название из списка.")
-        return
-    fsm["data"]["research_ingredient_id"] = chosen.id
-    fsm["data"]["research_ingredient_name"] = chosen.name.value
-    if chosen.name == IngredientName.BLOOD:
-        fsm["state"] = FsmState.RESEARCH_BLUE_MARK
-        await message.answer("Есть ли на ленте синяя метка? (да / нет)")
-        return
-    fsm["state"] = None
-    fsm["data"] = {}
-    desc = f"Ингредиент: {chosen.name.value}, категория: {chosen.category.value}."
-    await message.answer(desc)
-
-
-async def vk_research_blue_mark_next(message: Message, normalized_text: str):
-    """Ответ про синюю метку для крови → выдать описание «Особая кровь» или «Кровь»."""
-    peer_id = message.peer_id
-    fsm = get_fsm(peer_id)
-    fsm["state"] = None
-    fsm["data"] = {}
-    has_blue = normalized_text.lower().strip() in ("да", "yes", "1")
-    desc = "Особая кровь." if has_blue else "Кровь."
-    await message.answer(desc)
-
-
-async def vk_research_medicine_code_next(message: Message, normalized_text: str):
-    """Введён код лекарства → выдать описание лекарства."""
-    peer_id = message.peer_id
-    fsm = get_fsm(peer_id)
-    fsm["state"] = None
-    fsm["data"] = {}
-    try:
-        code = int(normalized_text.strip())
-    except ValueError:
-        await message.answer("Введите число — код лекарства.")
-        return
-    async with async_session() as session:
-        r = await session.execute(
-            select(Medicine).where(Medicine.code == code).options(
-                selectinload(Medicine.ingredient1),
-                selectinload(Medicine.ingredient2),
-            )
-        )
-        med = r.scalar_one_or_none()
-    if not med:
-        await message.answer("Лекарство с таким кодом не найдено.")
-        return
-    parts = [
-        f"Код: {med.code}",
-        f"Тип: {med.med_type.value}",
-        f"Слои лечения: 1={med.cure_layer_1}, 2={med.cure_layer_2}, 3={med.cure_layer_3}",
-        f"Боль: {med.pain}",
-    ]
-    if med.ingredient1:
-        parts.append(f"Ингредиент 1: {med.ingredient1.name.value}")
-    if med.ingredient2:
-        parts.append(f"Ингредиент 2: {med.ingredient2.name.value}")
-    await message.answer("\n".join(parts))
-
-
-async def vk_research_corpse_next(message: Message, normalized_text: str):
-    """Введён код трупа / username → описание пациента, статус заражения, болячки."""
-    peer_id = message.peer_id
-    fsm = get_fsm(peer_id)
-    fsm["state"] = None
-    fsm["data"] = {}
-    target = normalized_text.replace("@", "").strip()
-    if not target:
-        await message.answer("Введите @username или код трупа.")
-        return
-    async with async_session() as session:
-        user = await get_user_from_vk(session, None, target)
-        if not user and target.isdigit():
-            r = await session.execute(
-                select(User).where(User.id == int(target)).options(
-                    selectinload(User.slots).selectinload(Slot.skill),
-                    selectinload(User.slots).selectinload(Slot.disease),
-                )
-            )
-            user = r.scalar_one_or_none()
-    if not user:
-        await message.answer("Пациент с таким кодом или именем не найден.")
-        return
-    lines = [
-        f"Пациент: {user.character_name or user.tg_username or 'Неизвестный'}",
-        f"Статус заражения: {user.infection_status.value if user.infection_status else 'Здоров'}",
-    ]
-    for slot in user.slots or []:
-        if slot.disease:
-            d = slot.disease
-            lines.append(f"Болячка: {d.name} (тип: {d.type.value})")
-    await message.answer("\n".join(lines) if lines else "Нет данных.")
-
 
 async def vk_treat_target_next(message: Message, target_username: str):
     from datetime import datetime
@@ -1467,7 +1262,6 @@ async def _do_surgery_finalize(
         else:
             msgs.append(f"Лёгкое осложнение: {comp.name} — {comp.description}")
 
-    patient.last_cure_time = datetime.utcnow()
     patient_died = not patient.is_alive
     return msgs, patient_died
 
