@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import os
 import sys
+import unicodedata
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -24,11 +25,22 @@ from scripts.import_players import run as run_players
 
 
 def default_import_path(filename: str) -> str:
-    return os.path.join(
+    base_dir = os.path.join(
         os.path.dirname(os.path.dirname(__file__)),
         "import_data",
-        filename,
     )
+    direct_path = os.path.join(base_dir, filename)
+    if os.path.isfile(direct_path):
+        return direct_path
+
+    # На Linux разные Unicode-нормализации имени файла считаются разными путями
+    # (например "й" vs "й"). Сопоставляем имена в NFC, чтобы находить файл устойчиво.
+    target_nfc = unicodedata.normalize("NFC", filename)
+    for entry in os.listdir(base_dir):
+        if unicodedata.normalize("NFC", entry) == target_nfc:
+            return os.path.join(base_dir, entry)
+
+    return direct_path
 
 
 async def run_all(replace_existing: bool = True) -> None:
