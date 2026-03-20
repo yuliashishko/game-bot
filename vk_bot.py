@@ -1611,9 +1611,9 @@ async def vk_treat_medicines_next(message: Message, raw_codes: str):
     async with async_session() as session:
         medicines_result = await session.execute(select(Medicine).where(Medicine.code.in_(medicine_codes)))
         medicines = list(medicines_result.scalars().all())
-    if len(medicines) != len(medicine_codes):
-        found_codes = {medicine.code for medicine in medicines}
-        missing_codes = [code for code in medicine_codes if code not in found_codes]
+    found_codes = {m.code for m in medicines}
+    missing_codes = [code for code in sorted(set(medicine_codes)) if code not in found_codes]
+    if missing_codes:
         await message.answer(f"Не найдены лекарства с кодами: {missing_codes}. Введите коды снова.")
         return
     if any(m.med_type == MedType.SPECIAL for m in medicines):

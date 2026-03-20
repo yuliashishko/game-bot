@@ -211,9 +211,22 @@ async def do_treat_finalize(session, target_username: str, medicine_codes: list)
     Проводит лечение пациента. Возвращает (msg, patient_died).
     target_username — tg_username или vk_username игрока.
     """
-    result = await session.execute(select(Medicine).where(Medicine.code.in_(medicine_codes)))
+    # Важно: `medicine_codes` может содержать дубликаты (один и тот же код лекарства
+    # может быть использован несколько раз). Поэтому после выборки по `IN`
+    # раскладываем лекарства обратно в соответствии с исходным списком кодов.
+    distinct_codes = sorted(set(medicine_codes))
+    result = await session.execute(select(Medicine).where(Medicine.code.in_(distinct_codes)))
     medicines = list(result.scalars().all())
     if not medicines:
+        return "Лекарства не найдены.", False
+    medicines_by_code = {m.code: m for m in medicines if m.code is not None}
+    missing_codes = [code for code in distinct_codes if code not in medicines_by_code]
+    if missing_codes:
+        return f"Не найдены лекарства с кодами: {missing_codes}.", False
+
+    # meds_ordered имеет кратность как во входе
+    meds_ordered = [medicines_by_code.get(code) for code in medicine_codes]
+    if any(m is None for m in meds_ordered):
         return "Лекарства не найдены.", False
 
     r = await session.execute(
@@ -236,7 +249,7 @@ async def do_treat_finalize(session, target_username: str, medicine_codes: list)
             pain_sum += s.skill.pain or 0
         if s.disease:
             pain_sum += s.disease.pain or 0
-    for m in medicines:
+    for m in meds_ordered:
         pain_sum += m.pain or 0
     pain_sum += pain_disease_mod
 
@@ -248,9 +261,9 @@ async def do_treat_finalize(session, target_username: str, medicine_codes: list)
             True,
         )
 
-    cure_1 = sum(m.cure_layer_1 or 0 for m in medicines) + cure_mod
-    cure_2 = sum(m.cure_layer_2 or 0 for m in medicines) + cure_mod
-    cure_3 = sum(m.cure_layer_3 or 0 for m in medicines) + cure_mod
+    cure_1 = sum(m.cure_layer_1 or 0 for m in meds_ordered) + cure_mod
+    cure_2 = sum(m.cure_layer_2 or 0 for m in meds_ordered) + cure_mod
+    cure_3 = sum(m.cure_layer_3 or 0 for m in meds_ordered) + cure_mod
 
     symptom_slots = [
         (s, s.disease)
