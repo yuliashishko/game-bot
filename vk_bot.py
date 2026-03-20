@@ -123,6 +123,37 @@ async def get_night_active() -> bool:
         return row.night_active if row else False
 
 
+async def get_pause_active() -> bool:
+    async with async_session() as session:
+        result = await session.execute(select(GameSettings).where(GameSettings.id == 1))
+        row = result.scalar_one_or_none()
+        return row.pause_active if row else False
+
+
+class PauseActiveRule(ABCRule[Message]):
+    """Глобальный guard: пока активна пауза, никакие команды не обрабатываются, кроме /pause."""
+
+    async def check(self, message: Message) -> bool:
+        if not await get_pause_active():
+            return False
+        txt = (getattr(message, "text", None) or "").strip().lower()
+        if not txt:
+            return True
+        # Разрешаем админскую команду паузы
+        if txt.startswith("/"):
+            cmd = txt[1:]
+        elif txt.startswith("!"):
+            cmd = txt[1:]
+        else:
+            cmd = txt
+        return not cmd.startswith("pause")
+
+
+@bot.on.message(PauseActiveRule())
+async def vk_pause_guard(message: Message):
+    await message.answer("Бот сейчас на паузе администратором. Команды недоступны.")
+
+
 def _user_has_trauma(user) -> bool:
     """Есть ли у игрока хотя бы одна травма (слот с болезнью типа TRAUMA)."""
     if not getattr(user, "slots", None):
@@ -490,7 +521,7 @@ async def _do_night_toggle(message: Message) -> None:
         result = await session.execute(select(GameSettings).where(GameSettings.id == 1))
         settings = result.scalar_one_or_none()
         if not settings:
-            settings = GameSettings(id=1, night_active=False)
+            settings = GameSettings(id=1, night_active=False, pause_active=False)
             session.add(settings)
             await session.flush()
         settings.night_active = not settings.night_active
@@ -501,6 +532,34 @@ async def _do_night_toggle(message: Message) -> None:
     await message.answer(
         f"🌙 Ночь {status}. Кнопка «Заночевать» теперь {'видна' if new_state else 'скрыта'} у всех."
     )
+
+
+# ---------- Пауза (админ) ----------
+
+async def _do_pause_toggle(message: Message) -> None:
+    peer_id = message.peer_id
+    async with async_session() as session:
+        user = await get_user_from_vk(session, peer_id, None)
+        if not user or not user.is_admin:
+            await message.answer("Команда только для администраторов.")
+            return
+        result = await session.execute(select(GameSettings).where(GameSettings.id == 1))
+        settings = result.scalar_one_or_none()
+        if not settings:
+            settings = GameSettings(id=1, night_active=False, pause_active=False)
+            session.add(settings)
+            await session.flush()
+        settings.pause_active = not settings.pause_active
+        await session.commit()
+        new_state = settings.pause_active
+
+    status = "включена" if new_state else "выключена"
+    await message.answer(f"⏸ Пауза {status}.")
+
+
+@bot.on.message(CommandRule("pause", prefixes=["/", "!"], args_count=0))
+async def vk_pause_command_rule(message: Message):
+    await _do_pause_toggle(message)
 
 
 @bot.on.message(CommandRule("night", prefixes=["/", "!"], args_count=0))
@@ -558,10 +617,11 @@ async def vk_night_finalize(message: Message):
             energy += 2
         if use_melkiy:
             energy -= 1
-        energy = min(6, energy)
+        # Энергия не должна уходить ниже 0.
+        energy = max(0, min(6, energy))
 
         msg = f"🌙 Ночёвка\n\nВосстановлено энергии: {energy}"
-        if "Густая кровь" in active_skills:
+        if location.quality and "Густая кровь" in active_skills:
             wound_slots = [
                 slot
                 for slot in current_user.slots
@@ -602,6 +662,10 @@ async def vk_night_finalize(message: Message):
 
 @bot.on.message(text="🌙 Заночевать")
 async def vk_night_start(message: Message):
+    night_active = await get_night_active()
+    if not night_active:
+        await message.answer("Сейчас не ночь. Заночевать нельзя.")
+        return
     fsm = get_fsm(message.peer_id)
     fsm["state"] = FsmState.NIGHT_LOCATION
     fsm["data"] = {}
@@ -691,6 +755,10 @@ async def vk_fsm_text_handler(message: Message, text: str):
     raw_state = fsm.get("state")
     state = FsmState(raw_state) if isinstance(raw_state, str) else raw_state
     normalized_text = (text or "").strip()
+    # Чтобы команду /pause не пыталась обработать FSM-логика
+    normalized_cmd = normalized_text.lower().lstrip("!/ ")
+    if normalized_cmd.startswith("pause"):
+        return False
 
     # Привязка по username
     if state == FsmState.LINK_USERNAME:
@@ -718,6 +786,12 @@ async def vk_fsm_text_handler(message: Message, text: str):
 
     # Ночёвка FSM
     if state and state.value.startswith("night_"):
+        night_active = await get_night_active()
+        if not night_active:
+            fsm["state"] = None
+            fsm["data"] = {}
+            await message.answer("Сейчас не ночь. Заночевать нельзя.")
+            return
         match state:
             case FsmState.NIGHT_LOCATION:
                 async with async_session() as session:
@@ -726,11 +800,13 @@ async def vk_fsm_text_handler(message: Message, text: str):
                         await message.answer("Локация не найдена. Введите код или название:")
                         return
                     location_name = (resolved_location.name or "").strip().lower()
+                    is_steppe = (resolved_location.code == 1) or (location_name == "степь")
                     current_user = await get_user_from_vk(session, peer_id, None)
                     if (
-                        location_name == "степь"
+                        is_steppe
                         and current_user
-                        and "Привычный к степи" not in _user_active_skill_names(current_user)
+                        and "привычный к степи"
+                        not in {s.lower() for s in _user_active_skill_names(current_user)}
                     ):
                         fsm["state"] = None
                         await message.answer("Вы не можете ночевать здесь: нет навыка «Привычный к степи».")

@@ -232,3 +232,4 @@ class GameSettings(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     night_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    pause_active: Mapped[bool] = mapped_column(Boolean, default=False)
