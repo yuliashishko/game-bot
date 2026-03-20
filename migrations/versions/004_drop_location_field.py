@@ -1,6 +1,6 @@
 """Удалить неиспользуемые модификаторы из locations.
 
-Revision ID: 004_drop_unused_location_modifiers
+Revision ID: 004_drop_location_field
 Revises: 003_seed_game_settings
 Create Date: 2026-03-20
 """
@@ -9,7 +9,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "004_drop_unused_location_modifiers"
+revision = "004_drop_location_field"
 down_revision = "003_seed_game_settings"
 branch_labels = None
 depends_on = None
