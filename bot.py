@@ -606,14 +606,14 @@ async def get_symptom(session, user) -> str:
     result = await session.execute(select(Disease).where(Disease.type == DiseaseType.SYMPTOM))
     symptoms = list(result.scalars().all())
     if not symptoms:
-        return "Вы уже заражены. Автодействие «Получить симптом»: в базе нет симптомов."
+        return "Болезнь прогрессирует. Автодействие «Получить симптом»: в базе нет симптомов."
     disease = random.choice(symptoms)
     chosen_slot, remaining_health, skill_name = _apply_trauma(session, user, disease)
     if chosen_slot is None:
-        return "Вы уже заражены. Автодействие «Получить симптом»: нет свободной ячейки для симптома."
+        return "Болезнь прогрессирует. Автодействие «Получить симптом»: нет свободной ячейки для симптома."
     if remaining_health == 0:
         user.is_alive = False
-    msg = f"Вы уже заражены. Выполнено автодействие «Получить симптом»: получен симптом <b>{disease.name}</b>."
+    msg = f"Болезнь прогрессирует. Выполнено автодействие «Получить симптом»: получен симптом <b>{disease.name}</b>."
     if skill_name and skill_name != "Здоровье":
         msg += f"\n⚠️ Навык <b>{skill_name}</b> временно недоступен."
     if remaining_health == 0:

@@ -121,14 +121,14 @@ async def get_symptom(session, user) -> str:
     result = await session.execute(select(Disease).where(Disease.type == DiseaseType.SYMPTOM))
     symptoms = list(result.scalars().all())
     if not symptoms:
-        return "Вы уже заражены. Автодействие «Получить симптом»: в базе нет симптомов."
+        return "Болезнь прогрессирует. Автодействие «Получить симптом»: в базе нет симптомов."
     disease = random.choice(symptoms)
     chosen_slot, remaining_health, skill_name = _apply_trauma(session, user, disease)
     if chosen_slot is None:
-        return "Вы уже заражены. Автодействие «Получить симптом»: нет свободной ячейки для симптома."
+        return "Болезнь прогрессирует. Автодействие «Получить симптом»: нет свободной ячейки для симптома."
     if remaining_health == 0:
         user.is_alive = False
-    msg = f"Вы уже заражены. Выполнено автодействие «Получить симптом»: получен симптом {disease.name}."
+    msg = f"Болезнь прогрессирует. Выполнено автодействие «Получить симптом»: получен симптом {disease.name}."
     if skill_name and skill_name != "Здоровье":
         msg += f"\n⚠️ Навык {skill_name} временно недоступен."
     if remaining_health == 0:
@@ -304,12 +304,15 @@ async def do_treat_finalize(session, target_username: str, medicine_codes: list)
         else:
             cure_3 -= amount
 
+    removed_symptom_names: list[str] = []
+
     pairs_sorted = sorted(pairs, key=lambda x: (-sum(d.strength or 0 for _, d in x[2]), x[0]))
     for layer, strength, group in pairs_sorted:
         total_strength = sum(d.strength or 0 for _, d in group)
         if cure_for(layer) >= total_strength:
-            for slot, _ in group:
+            for slot, d in group:
                 slot.disease_id = None
+                removed_symptom_names.append(d.name)
             subtract_cure(layer, total_strength)
 
     unpaired_sorted = sorted(unpaired, key=lambda x: (-(x[1].strength or 0),))
@@ -318,6 +321,7 @@ async def do_treat_finalize(session, target_username: str, medicine_codes: list)
         strength = disease.strength or 0
         if cure_for(layer) >= strength:
             slot.disease_id = None
+            removed_symptom_names.append(disease.name)
             subtract_cure(layer, strength)
 
     n_consequences = pain_sum // PAIN_CONSEQUENCE_DIVISOR
@@ -342,6 +346,10 @@ async def do_treat_finalize(session, target_username: str, medicine_codes: list)
     await session.commit()
 
     msg = "💊 Лечение проведено."
+    if removed_symptom_names:
+        msg += "\n\nСнятые симптомы:\n" + "\n".join(f"• {name}" for name in removed_symptom_names)
+    else:
+        msg += "\n\nСнятые симптомы: нет"
     if consequence_msgs:
         msg += "\n\nПоследствия:\n" + "\n".join(consequence_msgs)
     if patient_died:

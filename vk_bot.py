@@ -1491,7 +1491,7 @@ async def vk_special_treat_target_next(message: Message, target_username: str):
     # Поэтому проверяем после ввода кода: если это не вакцина — требуется «Заражён».
     get_fsm(peer_id)["data"]["target_username"] = target_username
     get_fsm(peer_id)["state"] = FsmState.SPECIAL_TREAT_CODE
-    await message.answer("Введите 1 код особого лекарства (41 / 51 / 61):")
+    await message.answer("Введите 1 код особого лекарства.")
 
 
 async def vk_special_treat_code_next(message: Message, raw_code: str):
@@ -1507,12 +1507,12 @@ async def vk_special_treat_code_next(message: Message, raw_code: str):
     try:
         code = int((raw_code or "").strip())
     except ValueError:
-        await message.answer("Введите код числом (например 41).")
+        await message.answer("Введите код особого лекарства числом.")
         return
 
     kind = SPECIAL_MEDICINE_KIND_BY_CODE.get(code)
     if not kind:
-        await message.answer("Неизвестный код особого лекарства. Допустимые коды: 41, 51, 61.")
+        await message.answer("Неизвестный код особого лекарства.")
         return
 
     async with async_session() as session:
@@ -1556,19 +1556,22 @@ async def vk_special_treat_code_next(message: Message, raw_code: str):
                 await message.answer("Невозможно провести лечение: игрок лечился менее часа назад.")
                 return
 
-        def clear_symptoms() -> int:
-            removed = 0
+        def clear_symptoms() -> list[str]:
+            removed_names: list[str] = []
             for slot in patient.slots:
                 if slot.disease and slot.disease.type == DiseaseType.SYMPTOM:
+                    removed_names.append(slot.disease.name)
                     slot.disease_id = None
-                    removed += 1
-            return removed
+            return removed_names
 
         consequence_msgs: list[str] = []
         if kind == "Панацея":
-            removed = clear_symptoms()
+            removed_names = clear_symptoms()
             patient.infection_status = InfectionStatus.HEALTHY
-            consequence_msgs.append(f"Снято симптомов: {removed}.")
+            if removed_names:
+                consequence_msgs.append("Снятые симптомы:\n" + "\n".join(f"• {n}" for n in removed_names))
+            else:
+                consequence_msgs.append("Снятые симптомы: нет.")
 
         elif kind == "Вакцина":
             if patient.infection_status == InfectionStatus.HEALTHY:
@@ -1578,9 +1581,12 @@ async def vk_special_treat_code_next(message: Message, raw_code: str):
                 consequence_msgs.append("На заражённого вакцина не действует.")
 
         elif kind == "Порошочек":
-            removed = clear_symptoms()
+            removed_names = clear_symptoms()
             patient.infection_status = InfectionStatus.HEALTHY
-            consequence_msgs.append(f"Снято симптомов: {removed}.")
+            if removed_names:
+                consequence_msgs.append("Снятые симптомы:\n" + "\n".join(f"• {n}" for n in removed_names))
+            else:
+                consequence_msgs.append("Снятые симптомы: нет.")
 
             comp_result = await session.execute(
                 select(Complication).where(Complication.disease_comp_type.is_not(None))
@@ -1619,7 +1625,7 @@ async def vk_special_treat_code_next(message: Message, raw_code: str):
         patient.last_cure_time = datetime.utcnow()
         await session.commit()
 
-    msg = f"🧬 <b>Особое лечение</b> проведено: <b>{kind}</b>."
+    msg = f"🧬 Особое лечение проведено: {kind}."
     if consequence_msgs:
         msg += "\n\n" + "\n".join(consequence_msgs)
     await message.answer(msg, keyboard=await _main_keyboard_for_peer(peer_id))
