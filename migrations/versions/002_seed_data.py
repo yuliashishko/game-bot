@@ -39,12 +39,12 @@ def upgrade() -> None:
 
     # --- Лекарства ---
     op.execute(sa.text("""
-        INSERT INTO medicines (code, med_type, cure_layer_1, cure_layer_2, cure_layer_3, pain, ingredient1_id, ingredient2_id) VALUES
-        (1, 'ANTIBIOTIC', 2, 0, 0, 0, NULL, NULL),
-        (2, 'IMMUNIC', 0, 1, 0, 0, NULL, NULL),
-        (3, 'PAINKILLER', 0, 0, 0, 0, NULL, NULL),
-        (4, 'ANTIBIOTIC', 1, 1, 0, 1, NULL, NULL),
-        (5, 'IMMUNIC', 1, 0, 1, 0, NULL, NULL)
+        INSERT INTO medicines (code, med_type, cure_layer_1, cure_layer_2, cure_layer_3, pain) VALUES
+        (1, 'ANTIBIOTIC', 2, 0, 0, 0),
+        (2, 'IMMUNIC', 0, 1, 0, 0),
+        (3, 'PAINKILLER', 0, 0, 0, 0),
+        (4, 'ANTIBIOTIC', 1, 1, 0, 1),
+        (5, 'IMMUNIC', 1, 0, 1, 0)
     """))
 
     # --- Режим ночи ---

@@ -131,6 +131,7 @@ class Disease(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String)
+    description: Mapped[str] = mapped_column(String, default="")
     type: Mapped[DiseaseType] = mapped_column(Enum(DiseaseType))
     trauma_code: Mapped[Optional[int]] = mapped_column(Integer) 
     operation: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -178,12 +179,6 @@ class Medicine(Base):
     cure_layer_2: Mapped[int] = mapped_column(Integer, default=0)
     cure_layer_3: Mapped[int] = mapped_column(Integer, default=0)
     pain: Mapped[int] = mapped_column(Integer, default=0)
-    
-    ingredient1_id: Mapped[Optional[int]] = mapped_column(ForeignKey("ingredients.id"))
-    ingredient2_id: Mapped[Optional[int]] = mapped_column(ForeignKey("ingredients.id"))
-
-    ingredient1: Mapped[Optional["Ingredient"]] = relationship("Ingredient", foreign_keys=[ingredient1_id])
-    ingredient2: Mapped[Optional["Ingredient"]] = relationship("Ingredient", foreign_keys=[ingredient2_id])
 
 class Complication(Base):
     __tablename__ = "complications"
@@ -233,3 +228,24 @@ class GameSettings(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     night_active: Mapped[bool] = mapped_column(Boolean, default=False)
     pause_active: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class NightPeriod(Base):
+    """Период ночи: когда был включен и когда завершен."""
+    __tablename__ = "night_periods"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class NightStay(Base):
+    """Факт ночёвки игрока в рамках периода ночи."""
+    __tablename__ = "night_stays"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    period_id: Mapped[int] = mapped_column(ForeignKey("night_periods.id"), nullable=False)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    location_id: Mapped[Optional[int]] = mapped_column(ForeignKey("locations.id"), nullable=True)
+    stayed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    auto_applied: Mapped[bool] = mapped_column(Boolean, default=False)

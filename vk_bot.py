@@ -1,11 +1,11 @@
 """
-VK-бот: дублирует функциональность TG-бота (профиль, ранения, травмы, заражение,
-лечение, крафт, ночёвка, режим ночи для админов).
+VK-бот: профиль, ранения, травмы, заражение, лечение, ночёвка, режим ночи для админов.
 """
 import asyncio
 import json
 import logging
 import sys
+from datetime import datetime
 from enum import Enum
 from typing import Any
 
@@ -15,7 +15,7 @@ from vkbottle.dispatch.rules import ABCRule
 from vkbottle.dispatch.rules.base import CommandRule
 
 import random
-from sqlalchemy import select, and_, or_
+from sqlalchemy import select, or_
 from sqlalchemy.orm import selectinload
 
 from config import VK_TOKEN, VK_GROUP_ID
@@ -33,19 +33,14 @@ from database import (
     InfectionStatus,
     MedType,
     DiseaseCompType,
-    Ingredient,
-    IngredientName,
-    IngredientCategory,
     GameSettings,
+    NightPeriod,
+    NightStay,
 )
 from game_logic import (
-    MEDICINE_RECIPES,
-    RECIPE_TO_MED_TYPE,
     CURE_COOLDOWN_HOURS,
     PAIN_DEATH_THRESHOLD,
     PAIN_CONSEQUENCE_DIVISOR,
-    _user_has_medicine_recipe,
-    _user_medicine_recipes,
     _user_active_skill_names,
     _resolve_location,
     _apply_trauma,
@@ -65,7 +60,7 @@ vk_fsm: dict[int, dict[str, Any]] = {}
 
 
 class FsmState(str, Enum):
-    """Состояния FSM (привязка, ночёвка, лечение, крафт, вылечить травму)."""
+    """Состояния FSM (привязка, ночёвка, лечение, вылечить травму)."""
     LINK_USERNAME = "link_username"
     CURE_TRAUMA_CODE = "cure_trauma_code"
     NIGHT_LOCATION = "night_location"
@@ -80,10 +75,6 @@ class FsmState(str, Enum):
     SURGERY_CONFIRM_HOSPITAL = "surgery_confirm_hospital"
     SURGERY_TARGET = "surgery_target"
     SURGERY_MEDICINES = "surgery_medicines"
-    CRAFT_ALCHEMY = "craft_alchemy"
-    CRAFT_MED_TYPE = "craft_med_type"
-    CRAFT_INGREDIENT1 = "craft_ingredient1"
-    CRAFT_INGREDIENT2 = "craft_ingredient2"
 
 
 async def get_user_from_vk(session, vk_id: int | None, vk_username: str | None):
@@ -130,6 +121,45 @@ async def get_pause_active() -> bool:
         return row.pause_active if row else False
 
 
+async def _main_keyboard_for_peer(peer_id: int) -> str:
+    async with async_session() as session:
+        user = await get_user_from_vk(session, peer_id, None)
+        night_active = await get_night_active()
+        # Персонально скрываем кнопку ночёвки, если пользователь уже заночевал в текущем периоде.
+        if night_active and user:
+            current_period = await _get_current_night_period(session)
+            if current_period:
+                stay_result = await session.execute(
+                    select(NightStay).where(
+                        NightStay.period_id == current_period.id,
+                        NightStay.user_id == user.id,
+                    )
+                )
+                if stay_result.scalars().first():
+                    night_active = False
+    has_trauma = _user_has_trauma(user) if user else False
+    has_doctor = _user_has_doctor_skill(user) if user else False
+    return get_main_keyboard_vk(night_active, has_trauma, has_doctor)
+
+
+async def _send_vk_message(peer_id: int, text: str, *, keyboard: str | None = None) -> None:
+    """Отправка VK-сообщения по peer_id (тихо логирует ошибки)."""
+    try:
+        kwargs = {"peer_id": peer_id, "message": text, "random_id": random.randint(1, 2**31 - 1)}
+        if keyboard:
+            kwargs["keyboard"] = keyboard
+        await bot.api.messages.send(**kwargs)
+    except Exception as e:
+        logging.warning("Не удалось отправить VK сообщение peer_id=%s: %s", peer_id, e)
+
+
+async def _get_current_night_period(session) -> NightPeriod | None:
+    result = await session.execute(
+        select(NightPeriod).where(NightPeriod.ended_at.is_(None)).order_by(NightPeriod.id.desc())
+    )
+    return result.scalars().first()
+
+
 class PauseActiveRule(ABCRule[Message]):
     """Глобальный guard: пока активна пауза, никакие команды не обрабатываются, кроме /pause."""
 
@@ -160,7 +190,15 @@ class DeadPlayerRule(ABCRule[Message]):
     async def check(self, message: Message) -> bool:
         text = (getattr(message, "text", None) or "").strip().lower()
         # Разрешаем только профиль
-        if text in {"👤 мой профиль", "мой профиль", "/me", "!me", "me"}:
+        if text in {
+            "👤 мой профиль",
+            "мой профиль",
+            "📋 детальное описание профиля",
+            "детальное описание профиля",
+            "/me",
+            "!me",
+            "me",
+        }:
             return False
 
         async with async_session() as session:
@@ -195,12 +233,12 @@ def _user_has_doctor_skill(user) -> bool:
 
 def get_main_keyboard_vk(
     night_visible: bool = False,
-    has_craft_recipe: bool = False,
     has_trauma: bool = False,
     has_doctor: bool = False,
 ) -> str:
     k = Keyboard(one_time=False)
     k.add(Text("👤 Мой профиль"))
+    k.add(Text("📋 Детальное описание профиля"))
     k.row()
     k.add(Text("🩸 Получить ранение"))
     k.add(Text("🦴 Получить травму"))
@@ -208,6 +246,9 @@ def get_main_keyboard_vk(
     k.add(Text("🦠 Получить заражение"))
     k.add(Text("💊 Лечиться обычными лекарствами"))
     k.row()
+    if night_visible:
+        k.add(Text("🌙 Заночевать"))
+        k.row()
     k.add(Text("🧬 Лечиться особым лекарством"))
     if has_trauma:
         k.row()
@@ -215,12 +256,6 @@ def get_main_keyboard_vk(
     if has_doctor:
         k.row()
         k.add(Text("🏥 Провести хирургическую операцию"))
-    if has_craft_recipe:
-        k.row()
-        k.add(Text("🧪 Создать лекарство"))
-    if night_visible:
-        k.row()
-        k.add(Text("🌙 Заночевать"))
     return k.get_json()
 
 
@@ -231,6 +266,18 @@ def get_wound_keyboard_vk() -> str:
     k.add(Text("Ножевая", payload={"cmd": "wound_KNIFE"}))
     k.add(Text("Пулевая", payload={"cmd": "wound_BULLET"}))
     return k.get_json()
+
+
+def get_yes_no_keyboard_vk() -> str:
+    k = Keyboard(one_time=True)
+    k.add(Text("✅ Да", payload={"cmd": "yes"}))
+    k.add(Text("❌ Нет", payload={"cmd": "no"}))
+    return k.get_json()
+
+
+def _is_yes_answer(text: str) -> bool:
+    normalized = (text or "").strip().lower()
+    return normalized in {"да", "yes", "1", "✅ да"}
 
 
 def get_trauma_keyboard_vk(traumas: list) -> str:
@@ -271,9 +318,10 @@ def get_payload_cmd(message: Message) -> str | None:
 
 
 class HasPayloadRule(ABCRule[Message]):
-    """Правило: сообщение с payload (нажатие кнопки)."""
+    """Правило только для payload-кнопок, которые обрабатываются vk_payload_handler."""
     async def check(self, message: Message) -> bool:
-        return bool(getattr(message, "payload", None))
+        cmd = get_payload_cmd(message)
+        return bool(cmd and cmd.startswith(("wound_", "trauma_", "cure_trauma_")))
 
 
 class NightTextRule(ABCRule[Message]):
@@ -306,14 +354,10 @@ async def vk_start_handler(message: Message):
         user.is_active = True
         await session.commit()
 
-    night_active = await get_night_active()
-    has_craft = _user_has_medicine_recipe(user)
-    has_trauma = _user_has_trauma(user)
-    has_doctor = _user_has_doctor_skill(user)
     name = user.character_name or user.tg_username or "Игрок"
     await message.answer(
         f"Добро пожаловать, {name}! Ваш профиль активирован.",
-        keyboard=get_main_keyboard_vk(night_active, has_craft, has_trauma, has_doctor)
+        keyboard=await _main_keyboard_for_peer(peer_id),
     )
 
 
@@ -332,6 +376,7 @@ async def vk_me_handler(message: Message):
     traumas_text = []
     symptoms_text = []
     skills = []
+    recipes = []
     for slot in current_user.slots:
         is_blocked = slot.disease is not None
         if slot.disease:
@@ -350,24 +395,70 @@ async def vk_me_handler(message: Message):
                     health_current += 1
             elif not is_blocked:
                 skills.append(slot.skill.name)
+                for recipe in (slot.skill.recipes or []):
+                    recipe_name = recipe.value if hasattr(recipe, "value") else str(recipe)
+                    if recipe_name not in recipes:
+                        recipes.append(recipe_name)
 
     status_text = current_user.infection_status.value if current_user.infection_status else "Здоров"
     life_status = "Мёртв" if not current_user.is_alive else "Жив"
+    weak_zones = [z.value if hasattr(z, "value") else str(z) for z in (current_user.weak_zones or [])]
     char_name = current_user.character_name or "Неизвестный"
     msg = f"👤 Профиль игрока {char_name}\n\n"
     msg += f"☠️ Статус персонажа: {life_status}\n"
     msg += f"🦠 Статус инфекции: {status_text}\n"
     msg += f"❤️ Здоровье: {health_current} / {health_max}\n"
-    msg += f"🩸 Ран: {wounds}\n\n"
+    msg += f"🩸 Ран: {wounds}\n"
+    msg += "🎯 Слабые зоны: " + (", ".join(weak_zones) if weak_zones else "Нет") + "\n\n"
     msg += "Травмы:\n" + ("\n".join(set(traumas_text)) if traumas_text else "Нет") + "\n\n"
     msg += "Симптомы:\n" + ("\n".join(set(symptoms_text)) if symptoms_text else "Нет") + "\n\n"
-    msg += "Активные навыки:\n" + ("\n".join(f"🧠 {s}" for s in skills) if skills else "Нет")
+    msg += "Активные навыки:\n" + ("\n".join(f"🧠 {s}" for s in skills) if skills else "Нет") + "\n\n"
+    msg += "Доступные рецепты:\n" + ("\n".join(f"📜 {r}" for r in recipes) if recipes else "Нет")
 
-    night_active = await get_night_active()
-    has_craft = _user_has_medicine_recipe(current_user)
-    has_trauma = _user_has_trauma(current_user)
-    has_doctor = _user_has_doctor_skill(current_user)
-    await message.answer(msg, keyboard=get_main_keyboard_vk(night_active, has_craft, has_trauma, has_doctor))
+    await message.answer(msg, keyboard=await _main_keyboard_for_peer(peer_id))
+
+
+@bot.on.message(text="📋 Детальное описание профиля")
+@bot.on.message(command=("profile_details", 0))
+async def vk_profile_details_handler(message: Message):
+    peer_id = message.peer_id
+    async with async_session() as session:
+        current_user = await get_user_from_vk(session, peer_id, None)
+        if not current_user:
+            await message.answer("Вы не подключены. Напишите /start для привязки.")
+            return
+
+    wounds: list[str] = []
+    traumas: list[str] = []
+    symptoms: list[str] = []
+    skills: list[str] = []
+
+    def _disease_details_text(disease) -> str:
+        description = (getattr(disease, "description", "") or "").strip()
+        return description or "Описание отсутствует."
+
+    for slot in current_user.slots or []:
+        if slot.disease:
+            disease = slot.disease
+            disease_line = f"• {disease.name} — {_disease_details_text(disease)}"
+            match disease.type:
+                case DiseaseType.WOUND:
+                    wounds.append(disease_line)
+                case DiseaseType.TRAUMA:
+                    traumas.append(disease_line)
+                case DiseaseType.SYMPTOM:
+                    symptoms.append(disease_line)
+        if slot.skill and slot.disease_id is None:
+            desc = (slot.skill.description or "").strip()
+            skills.append(f"• {slot.skill.name}: {desc}" if desc else f"• {slot.skill.name}")
+
+    char_name = current_user.character_name or "Неизвестный"
+    msg = f"📋 Детальный профиль: {char_name}\n\n"
+    msg += "Болячки (раны):\n" + ("\n".join(wounds) if wounds else "Нет") + "\n\n"
+    msg += "Травмы:\n" + ("\n".join(traumas) if traumas else "Нет") + "\n\n"
+    msg += "Симптомы:\n" + ("\n".join(symptoms) if symptoms else "Нет") + "\n\n"
+    msg += "Навыки:\n" + ("\n".join(skills) if skills else "Нет")
+    await message.answer(msg, keyboard=await _main_keyboard_for_peer(peer_id))
 
 
 # ---------- Привязка по username (внутри единого FSM-обработчика) ----------
@@ -438,12 +529,7 @@ async def vk_payload_handler(message: Message):
             msg += f"\n❤️ Осталось здоровья: {remaining_health}"
         await message.answer(
             msg,
-            keyboard=get_main_keyboard_vk(
-                await get_night_active(),
-                _user_has_medicine_recipe(current_user),
-                _user_has_trauma(current_user),
-                _user_has_doctor_skill(current_user),
-            ),
+            keyboard=await _main_keyboard_for_peer(peer_id),
         )
         return True
 
@@ -487,12 +573,7 @@ async def vk_payload_handler(message: Message):
             msg += f"\n❤️ Осталось здоровья: {remaining_health}"
         await message.answer(
             msg,
-            keyboard=get_main_keyboard_vk(
-                await get_night_active(),
-                _user_has_medicine_recipe(current_user),
-                _user_has_trauma(current_user),
-                _user_has_doctor_skill(current_user),
-            ),
+            keyboard=await _main_keyboard_for_peer(peer_id),
         )
         return True
 
@@ -555,13 +636,9 @@ async def vk_payload_handler(message: Message):
                 pass
             await session.commit()
 
-        night_active = await get_night_active()
-        has_craft = _user_has_medicine_recipe(current_user)
-        has_trauma = _user_has_trauma(current_user)
-        has_doctor = _user_has_doctor_skill(current_user)
         await message.answer(
             f"Травма «{trauma_name}» снята.",
-            keyboard=get_main_keyboard_vk(night_active, has_craft, has_trauma, has_doctor),
+            keyboard=await _main_keyboard_for_peer(peer_id),
         )
         return True
 
@@ -624,6 +701,183 @@ async def vk_medicines_handler(message: Message):
 
 # ---------- Режим ночи (админ) ----------
 
+async def _apply_auto_night_action(session, user: User, period: NightPeriod | None, gavno_location: Location | None) -> str:
+    """
+    Автодействие в конце ночи для тех, кто не заночевал:
+    - локация "Говно"
+    - проверка заражения
+    - травма "Бессонница" (код 3)
+    """
+    now_msg_parts = ["🌙 Вы не выполнили действие «Заночевать» до конца ночи. Применено автодействие."]
+    active_skills = set(_user_active_skill_names(user))
+    if gavno_location:
+        roll = random.randint(0, max(0, gavno_location.infection_chance))
+        if user.is_child:
+            roll -= 10
+        if "Крепыш" in active_skills:
+            roll -= 10
+        if roll > 0:
+            infection_msg = await apply_infection(session, user)
+            now_msg_parts.append(f"🦠 Заражение: {infection_msg}")
+        else:
+            now_msg_parts.append("🦠 Заражения не произошло.")
+    else:
+        now_msg_parts.append("⚠️ Локация «Говно» не найдена в базе.")
+
+    ok, trauma_msg = await _apply_trauma_by_code(session, user, 3)  # Бессонница
+    if ok:
+        now_msg_parts.append(f"🩹 Применена травма: {trauma_msg}.")
+    else:
+        now_msg_parts.append(f"⚠️ Не удалось применить травму «Бессонница»: {trauma_msg}")
+
+    if period:
+        auto_stay = NightStay(
+            period_id=period.id,
+            user_id=user.id,
+            location_id=gavno_location.id if gavno_location else None,
+            stayed_at=datetime.utcnow(),
+            auto_applied=True,
+        )
+        session.add(auto_stay)
+
+    return "\n".join(now_msg_parts)
+
+
+async def _notify_night_started() -> None:
+    async with async_session() as session:
+        result = await session.execute(
+            select(User).where(User.vk_id.is_not(None), User.is_alive == True)
+        )
+        users = list(result.scalars().all())
+    logging.info("Старт ночи: отправляем уведомление %s пользователям", len(users))
+    for user in users:
+        keyboard = await _main_keyboard_for_peer(user.vk_id)
+        await _send_vk_message(
+            user.vk_id,
+            "🌙 Наступила ночь. Доступно действие «Заночевать».",
+            keyboard=keyboard,
+        )
+
+
+async def _handle_night_finished(session, period: NightPeriod | None) -> tuple[list[str], list[str], list[str]]:
+    """
+    Завершение ночи:
+    - автодействие тем, кто не заночевал
+    - вернуть строки (не заночевали, заночевали) для админской сводки
+    """
+    users_result = await session.execute(
+        select(User)
+        .options(
+            selectinload(User.slots).selectinload(Slot.skill),
+            selectinload(User.slots).selectinload(Slot.disease),
+        )
+        .where(User.vk_id.is_not(None), User.is_alive == True)
+    )
+    active_users = list(users_result.scalars().all())
+    logging.info("Конец ночи: кандидатов для автодействия=%s", len(active_users))
+
+    stayed_user_ids: set[int] = set()
+    stays_by_user_id: dict[int, NightStay] = {}
+    all_stays: list[NightStay] = []
+    if period:
+        stays_result = await session.execute(select(NightStay).where(NightStay.period_id == period.id))
+        all_stays = list(stays_result.scalars().all())
+        stayed_user_ids = {s.user_id for s in all_stays}
+        stays_by_user_id = {s.user_id: s for s in all_stays}
+
+    location_result = await session.execute(select(Location).where(Location.code == 0))
+    gavno_location = location_result.scalars().first()
+    location_names = {}
+    all_locations_result = await session.execute(select(Location))
+    for loc in all_locations_result.scalars().all():
+        location_names[loc.id] = loc.name or f"#{loc.code}"
+
+    missing_lines: list[str] = []
+    stayed_lines: list[str] = []
+
+    # Блок "Заночевали" строим по фактическим NightStay (независимо от is_active),
+    # чтобы сводка не была пустой при неактивном флаге у игроков.
+    if all_stays:
+        user_ids = sorted({s.user_id for s in all_stays})
+        users_result = await session.execute(select(User).where(User.id.in_(user_ids)))
+        users_map = {u.id: u for u in users_result.scalars().all()}
+        for stay in all_stays:
+            u = users_map.get(stay.user_id)
+            display_name = (
+                (u.character_name if u else None)
+                or (u.vk_username if u else None)
+                or (u.tg_username if u else None)
+                or f"id={stay.user_id}"
+            )
+            loc_name = location_names.get(stay.location_id, "Неизвестно")
+            suffix = " (авто)" if stay.auto_applied else ""
+            stayed_lines.append(f"• {display_name} — {loc_name}{suffix}")
+
+    for user in active_users:
+        display_name = user.character_name or user.vk_username or user.tg_username or f"id={user.id}"
+        if user.id not in stayed_user_ids:
+            auto_msg = await _apply_auto_night_action(session, user, period, gavno_location)
+            missing_lines.append(f"• {display_name}")
+            await _send_vk_message(user.vk_id, auto_msg, keyboard=await _main_keyboard_for_peer(user.vk_id))
+            continue
+
+    # Проверка превышения вместимости среди тех, кто реально заночевал сам (без авто-действия)
+    overflow_lines: list[str] = []
+    if period:
+        manual_stays_result = await session.execute(
+            select(NightStay).where(NightStay.period_id == period.id, NightStay.auto_applied == False)
+        )
+        manual_stays = list(manual_stays_result.scalars().all())
+        if manual_stays:
+            count_by_location_id: dict[int, int] = {}
+            for stay in manual_stays:
+                if stay.location_id is None:
+                    continue
+                count_by_location_id[stay.location_id] = count_by_location_id.get(stay.location_id, 0) + 1
+
+            for location_id, stayed_count in count_by_location_id.items():
+                loc_name = location_names.get(location_id, f"id={location_id}")
+                # Ищем capacity по уже загруженным локациям (в location_names его нет)
+                loc_result = await session.execute(select(Location).where(Location.id == location_id))
+                loc = loc_result.scalars().first()
+                capacity = loc.capacity if loc else 0
+                if capacity > 0 and stayed_count > capacity:
+                    overflow_lines.append(
+                        f"• {loc_name}: {stayed_count}/{capacity} (превышение на {stayed_count - capacity})"
+                    )
+
+    return missing_lines, stayed_lines, overflow_lines
+
+
+def _build_night_summary_text(
+    missing_lines: list[str], stayed_lines: list[str], overflow_lines: list[str]
+) -> str:
+    summary = ["🌙 Ночь завершена. Сводка:"]
+    summary.append("\nНе заночевали (сверху):")
+    summary.append("\n".join(missing_lines) if missing_lines else "Нет")
+    summary.append("\nЗаночевали:")
+    summary.append("\n".join(stayed_lines) if stayed_lines else "Нет")
+    summary.append("\nПревышение вместимости локаций:")
+    summary.append("\n".join(overflow_lines) if overflow_lines else "Нет")
+    return "\n".join(summary)
+
+
+async def _notify_admins_night_summary(
+    missing_lines: list[str], stayed_lines: list[str], overflow_lines: list[str], initiator_peer_id: int | None = None
+) -> None:
+    async with async_session() as session:
+        admins_result = await session.execute(
+            select(User).where(User.is_admin == True, User.vk_id.is_not(None))
+        )
+        admins = list(admins_result.scalars().all())
+    recipient_peer_ids = {admin.vk_id for admin in admins if admin.vk_id}
+    if not recipient_peer_ids:
+        return
+    text = _build_night_summary_text(missing_lines, stayed_lines, overflow_lines)
+    for peer_id in recipient_peer_ids:
+        await _send_vk_message(peer_id, text, keyboard=await _main_keyboard_for_peer(peer_id))
+
+
 async def _do_night_toggle(message: Message) -> None:
     peer_id = message.peer_id
     async with async_session() as session:
@@ -638,13 +892,43 @@ async def _do_night_toggle(message: Message) -> None:
             session.add(settings)
             await session.flush()
         settings.night_active = not settings.night_active
-        await session.commit()
         new_state = settings.night_active
+
+        if new_state:
+            # Старт ночи: открыть период
+            period = NightPeriod(started_at=datetime.utcnow(), ended_at=None)
+            session.add(period)
+            await session.flush()
+        else:
+            # Конец ночи: закрыть текущий период и применить автодействия
+            period = await _get_current_night_period(session)
+            if period:
+                logging.info(
+                    "Закрываем период ночи: id=%s started_at=%s",
+                    period.id,
+                    period.started_at,
+                )
+                period.ended_at = datetime.utcnow()
+            else:
+                logging.warning("Ночь выключается, но открытый период ночи не найден.")
+            missing_lines, stayed_lines, overflow_lines = await _handle_night_finished(session, period)
+        await session.commit()
 
     status = "включена" if new_state else "выключена"
     await message.answer(
         f"🌙 Ночь {status}. Кнопка «Заночевать» теперь {'видна' if new_state else 'скрыта'} у всех."
     )
+    if new_state:
+        await _notify_night_started()
+    else:
+        # Гарантированно показываем сводку инициатору в текущем диалоге.
+        await message.answer(
+            _build_night_summary_text(missing_lines, stayed_lines, overflow_lines),
+            keyboard=await _main_keyboard_for_peer(peer_id),
+        )
+        await _notify_admins_night_summary(
+            missing_lines, stayed_lines, overflow_lines, initiator_peer_id=peer_id
+        )
 
 
 # ---------- Пауза (админ) ----------
@@ -710,6 +994,37 @@ async def vk_night_finalize(message: Message):
             await message.answer("Персонаж не найден или мёртв.")
             return
 
+        # Фиксируем факт ночёвки в текущем периоде ночи.
+        current_period = await _get_current_night_period(session)
+        # Страховка: если открытого периода нет, но ночь активна — создаём период лениво.
+        if not current_period:
+            gs_result = await session.execute(select(GameSettings).where(GameSettings.id == 1))
+            gs = gs_result.scalar_one_or_none()
+            if gs and gs.night_active:
+                current_period = NightPeriod(started_at=datetime.utcnow(), ended_at=None)
+                session.add(current_period)
+                await session.flush()
+        if current_period:
+            existing_stay_result = await session.execute(
+                select(NightStay).where(
+                    NightStay.period_id == current_period.id,
+                    NightStay.user_id == current_user.id,
+                )
+            )
+            existing_stay = existing_stay_result.scalars().first()
+            if existing_stay:
+                await message.answer("Вы уже заночевали в этом периоде ночи. Повторная ночёвка недоступна.")
+                return
+            session.add(
+                NightStay(
+                    period_id=current_period.id,
+                    user_id=current_user.id,
+                    location_id=location.id,
+                    stayed_at=datetime.utcnow(),
+                    auto_applied=False,
+                )
+            )
+
         active_skills = _user_active_skill_names(current_user)
         energy = 0
         if location.quality:
@@ -764,12 +1079,7 @@ async def vk_night_finalize(message: Message):
 
     await message.answer(
         msg,
-        keyboard=get_main_keyboard_vk(
-            True,
-            _user_has_medicine_recipe(current_user),
-            _user_has_trauma(current_user),
-            _user_has_doctor_skill(current_user),
-        ),
+        keyboard=await _main_keyboard_for_peer(message.peer_id),
     )
 
 
@@ -779,6 +1089,21 @@ async def vk_night_start(message: Message):
     if not night_active:
         await message.answer("Сейчас не ночь. Заночевать нельзя.")
         return
+    async with async_session() as session:
+        current_user = await get_user_from_vk(session, message.peer_id, None)
+        if current_user:
+            current_period = await _get_current_night_period(session)
+            if current_period:
+                stay_result = await session.execute(
+                    select(NightStay).where(
+                        NightStay.period_id == current_period.id,
+                        NightStay.user_id == current_user.id,
+                    )
+                )
+                existing_stay = stay_result.scalars().first()
+                if existing_stay:
+                    await message.answer("Вы уже заночевали в этом периоде ночи.")
+                    return
     fsm = get_fsm(message.peer_id)
     fsm["state"] = FsmState.NIGHT_LOCATION
     fsm["data"] = {}
@@ -847,35 +1172,17 @@ async def vk_surgery_start(message: Message):
         return
     get_fsm(peer_id)["state"] = FsmState.SURGERY_CONFIRM_HOSPITAL
     get_fsm(peer_id)["data"] = {"initiator_peer_id": peer_id}
-    await message.answer("Подтверждаете, что находитесь в Госпитале? (да / нет)")
-
-# ---------- Создать лекарство (FSM) — регистрируем ДО общего text="<text>", иначе не сработает ----------
-
-@bot.on.message(text="🧪 Создать лекарство")
-async def vk_craft_start(message: Message):
-    peer_id = message.peer_id
-    async with async_session() as session:
-        user = await get_user_from_vk(session, peer_id, None)
-    if not user:
-        await message.answer("Вы не подключены.")
-        return
-    if not _user_has_medicine_recipe(user):
-        await message.answer("У вас нет рецептов создания лекарств.")
-        return
-    recipes = _user_medicine_recipes(user)
-    if not recipes:
-        await message.answer("Нет рецептов.")
-        return
-    get_fsm(peer_id)["state"] = FsmState.CRAFT_ALCHEMY
-    get_fsm(peer_id)["data"] = {"craft_peer_id": peer_id}
-    await message.answer("Используете алхимический стол? (да / нет)")
-
+    await message.answer(
+        "Подтверждаете, что находитесь в Госпитале?",
+        keyboard=get_yes_no_keyboard_vk(),
+    )
 
 @bot.on.message(text="<text>")
 async def vk_fsm_text_handler(message: Message, text: str):
-    """Единый обработчик текста для FSM: привязка, ночёвка, лечение, крафт."""
-    if get_payload_cmd(message):
-        return False  # Кнопки обрабатывает vk_payload_handler
+    """Единый обработчик текста для FSM: привязка, ночёвка, лечение."""
+    payload_cmd = get_payload_cmd(message)
+    if payload_cmd and payload_cmd.startswith(("wound_", "trauma_", "cure_trauma_")):
+        return False  # Эти payload-кнопки обрабатывает vk_payload_handler
     peer_id = message.peer_id
     fsm = get_fsm(peer_id)
     raw_state = fsm.get("state")
@@ -900,13 +1207,9 @@ async def vk_fsm_text_handler(message: Message, text: str):
             await session.commit()
         fsm["state"] = None
         fsm["data"] = {}
-        night_active = await get_night_active()
-        has_craft = _user_has_medicine_recipe(linked_user)
-        has_trauma = _user_has_trauma(linked_user)
-        has_doctor = _user_has_doctor_skill(linked_user)
         await message.answer(
             f"Привязано к персонажу {linked_user.character_name}. Добро пожаловать!",
-            keyboard=get_main_keyboard_vk(night_active, has_craft, has_trauma, has_doctor)
+            keyboard=await _main_keyboard_for_peer(peer_id),
         )
         return
 
@@ -942,14 +1245,17 @@ async def vk_fsm_text_handler(message: Message, text: str):
                     fsm["data"]["use_melkiy"] = False
                     if resolved_location.quality and current_user and "Мелкий" in _user_active_skill_names(current_user):
                         fsm["state"] = FsmState.NIGHT_USE_MELKIY
-                        await message.answer("Использовать навык «Мелкий»? (да / нет)")
+                        await message.answer(
+                            "Использовать навык «Мелкий»?",
+                            keyboard=get_yes_no_keyboard_vk(),
+                        )
                         return
                 fsm["state"] = FsmState.NIGHT_FOOD
                 await message.answer("Введите количество съеденной еды (0–3):")
                 return
 
             case FsmState.NIGHT_USE_MELKIY:
-                fsm["data"]["use_melkiy"] = normalized_text.lower() in ("да", "yes", "1")
+                fsm["data"]["use_melkiy"] = _is_yes_answer(normalized_text)
                 fsm["state"] = FsmState.NIGHT_FOOD
                 await message.answer("Введите количество съеденной еды (0–3):")
                 return
@@ -973,11 +1279,14 @@ async def vk_fsm_text_handler(message: Message, text: str):
                     return
                 fsm["data"]["immunics"] = immunics
                 fsm["state"] = FsmState.NIGHT_PAINKILLER
-                await message.answer("Использовали обезболивающее? (да / нет)")
+                await message.answer(
+                    "Использовали обезболивающее?",
+                    keyboard=get_yes_no_keyboard_vk(),
+                )
                 return
 
             case FsmState.NIGHT_PAINKILLER:
-                fsm["data"]["painkiller"] = normalized_text.lower() in ("да", "yes", "1")
+                fsm["data"]["painkiller"] = _is_yes_answer(normalized_text)
                 await vk_night_finalize(message)
                 return
 
@@ -1012,13 +1321,9 @@ async def vk_fsm_text_handler(message: Message, text: str):
                 return
             slot_with_trauma.disease_id = None
             await session.commit()
-        night_active = await get_night_active()
-        has_craft = _user_has_medicine_recipe(current_user)
-        has_trauma = _user_has_trauma(current_user)
-        has_doctor = _user_has_doctor_skill(current_user)
         await message.answer(
             f"Травма «{trauma_name}» снята.",
-            keyboard=get_main_keyboard_vk(night_active, has_craft, has_trauma, has_doctor),
+            keyboard=await _main_keyboard_for_peer(peer_id),
         )
         return
 
@@ -1067,7 +1372,7 @@ async def vk_fsm_text_handler(message: Message, text: str):
             return
 
         case FsmState.SURGERY_CONFIRM_HOSPITAL:
-            if normalized_text.lower() not in ("да", "yes", "1"):
+            if not _is_yes_answer(normalized_text):
                 fsm["state"] = None
                 fsm["data"] = {}
                 await message.answer("Действие отменено. Подтвердите нахождение в Госпитале для проведения операции.")
@@ -1084,7 +1389,10 @@ async def vk_fsm_text_handler(message: Message, text: str):
             if target_input == "себя":
                 fsm["state"] = None
                 fsm["data"] = {}
-                await message.answer("Невозможно провести операцию над собой. Действие завершено.")
+                await message.answer(
+                    "Невозможно провести операцию над собой. Действие завершено.",
+                    keyboard=await _main_keyboard_for_peer(peer_id),
+                )
                 return
             await vk_surgery_target_next(message, target_input)
             return
@@ -1093,23 +1401,6 @@ async def vk_fsm_text_handler(message: Message, text: str):
             await vk_surgery_medicines_next(message, text or "")
             return
 
-        case FsmState.CRAFT_ALCHEMY:
-            fsm["data"]["use_alchemy"] = normalized_text.lower() in ("да", "yes", "1")
-            fsm["state"] = FsmState.CRAFT_MED_TYPE
-            await vk_craft_ask_med_type(message)
-            return
-
-        case FsmState.CRAFT_MED_TYPE:
-            await vk_craft_med_type_next(message, normalized_text)
-            return
-
-        case FsmState.CRAFT_INGREDIENT1:
-            await vk_craft_ingredient1_next(message, normalized_text)
-            return
-
-        case FsmState.CRAFT_INGREDIENT2:
-            await vk_craft_ingredient2_next(message, normalized_text)
-            return
 
 async def vk_treat_target_next(message: Message, target_username: str):
     from datetime import datetime
@@ -1331,7 +1622,7 @@ async def vk_special_treat_code_next(message: Message, raw_code: str):
     msg = f"🧬 <b>Особое лечение</b> проведено: <b>{kind}</b>."
     if consequence_msgs:
         msg += "\n\n" + "\n".join(consequence_msgs)
-    await message.answer(msg)
+    await message.answer(msg, keyboard=await _main_keyboard_for_peer(peer_id))
 
 
 async def vk_surgery_target_next(message: Message, target_username: str):
@@ -1539,211 +1830,11 @@ async def vk_surgery_medicines_next(message: Message, raw: str):
     result = "🏥 Хирургическая операция проведена."
     if msgs:
         result += "\n\nОсложнения:\n" + "\n".join(msgs)
-    await message.answer(result)
+    await message.answer(result, keyboard=await _main_keyboard_for_peer(peer_id))
     if patient_died:
         await message.answer(
             "Пациент умер в результате операции. Напоминание: необходимо получить метку репутации."
         )
-
-
-def _resolve_ingredient_from_list(ingredients: list, text: str):
-    """По номеру (1-based) или названию возвращает Ingredient или None."""
-    text = (text or "").strip()
-    try:
-        idx = int(text)
-        if 1 <= idx <= len(ingredients):
-            return ingredients[idx - 1]
-    except ValueError:
-        pass
-    text_lower = text.lower()
-    for ing in ingredients:
-        if (ing.name.value or "").lower() == text_lower:
-            return ing
-    return None
-
-
-async def vk_craft_ask_med_type(message: Message):
-    """Запросить тип лекарства (только из рецептов игрока)."""
-    peer_id = message.peer_id
-    fsm = get_fsm(peer_id)
-    craft_peer_id = fsm.get("data", {}).get("craft_peer_id", peer_id)
-    async with async_session() as session:
-        user = await get_user_from_vk(session, craft_peer_id, None)
-    if not user:
-        fsm["state"] = None
-        fsm["data"] = {}
-        await message.answer("Ошибка: пользователь не найден.")
-        return
-    recipes = _user_medicine_recipes(user)
-    if not recipes:
-        fsm["state"] = None
-        fsm["data"] = {}
-        await message.answer("Нет доступных рецептов.")
-        return
-    type_names = []
-    for r in recipes:
-        mt = RECIPE_TO_MED_TYPE.get(r)
-        if mt:
-            type_names.append(mt.value)
-    fsm["data"]["craft_recipe_types"] = [RECIPE_TO_MED_TYPE[r].name for r in recipes if RECIPE_TO_MED_TYPE.get(r)]
-    await message.answer(
-        "Выберите тип создаваемого лекарства (введите название): " + ", ".join(type_names) + "."
-    )
-
-
-async def vk_craft_med_type_next(message: Message, normalized_text: str):
-    """Выбран тип лекарства → запрос первого компонента."""
-    peer_id = message.peer_id
-    fsm = get_fsm(peer_id)
-    allowed = fsm.get("data", {}).get("craft_recipe_types", [])
-    med_map = {"иммуники": "IMMUNIC", "антибиотики": "ANTIBIOTIC", "обезболивающие": "PAINKILLER", "особое": "SPECIAL"}
-    med_name = med_map.get(normalized_text.lower())
-    if not med_name or med_name not in allowed:
-        await message.answer("Введите тип из ваших рецептов: " + ", ".join(MedType[mn].value for mn in allowed) + ".")
-        return
-    fsm["data"]["craft_med_type"] = med_name
-    med_type = MedType[med_name]
-    async with async_session() as session:
-        if med_type == MedType.SPECIAL:
-            result = await session.execute(select(Ingredient).where(Ingredient.name == IngredientName.OTHER))
-        else:
-            result = await session.execute(select(Ingredient).where(Ingredient.category == IngredientCategory.HERB))
-        ingredients = list(result.scalars().all())
-    if not ingredients:
-        fsm["state"] = None
-        fsm["data"] = {}
-        await message.answer("В базе нет подходящих ингредиентов для первого компонента.")
-        return
-    fsm["data"]["craft_ing1_list"] = [(ing.id, ing.name.value) for ing in ingredients]
-    fsm["state"] = FsmState.CRAFT_INGREDIENT1
-    lines = ["Выберите первый компонент (введите номер или название):"]
-    for i, (_, name) in enumerate(fsm["data"]["craft_ing1_list"], 1):
-        lines.append(f"  {i}. {name}")
-    await message.answer("\n".join(lines))
-
-
-async def vk_craft_ingredient1_next(message: Message, normalized_text: str):
-    """Выбран первый компонент → запрос второго."""
-    peer_id = message.peer_id
-    fsm = get_fsm(peer_id)
-    ing_list = fsm.get("data", {}).get("craft_ing1_list", [])
-    if not ing_list:
-        fsm["state"] = None
-        await message.answer("Ошибка сессии. Начните крафт заново.")
-        return
-    async with async_session() as session:
-        ingredients = []
-        for ing_id, _ in ing_list:
-            r = await session.execute(select(Ingredient).where(Ingredient.id == ing_id))
-            ing = r.scalar_one_or_none()
-            if ing:
-                ingredients.append(ing)
-    chosen = _resolve_ingredient_from_list(ingredients, normalized_text)
-    if not chosen:
-        await message.answer("Не найдено. Введите номер из списка или название ингредиента.")
-        return
-    fsm["data"]["craft_ing1_id"] = chosen.id
-    med_name = fsm.get("data", {}).get("craft_med_type", "IMMUNIC")
-    med_type = MedType[med_name] if med_name else MedType.IMMUNIC
-    async with async_session() as session:
-        if med_type == MedType.SPECIAL:
-            result = await session.execute(select(Ingredient).where(Ingredient.name == IngredientName.OTHER))
-        elif med_type == MedType.IMMUNIC:
-            result = await session.execute(select(Ingredient).where(Ingredient.category == IngredientCategory.HERB))
-        elif med_type == MedType.ANTIBIOTIC:
-            result = await session.execute(select(Ingredient).where(Ingredient.category == IngredientCategory.ORGAN))
-        elif med_type == MedType.PAINKILLER:
-            result = await session.execute(select(Ingredient).where(Ingredient.name == IngredientName.BLOOD))
-        else:
-            result = await session.execute(select(Ingredient))
-        ingredients2 = list(result.scalars().all())
-    if not ingredients2:
-        fsm["state"] = None
-        fsm["data"] = {}
-        await message.answer("В базе нет подходящих ингредиентов для второго компонента.")
-        return
-    fsm["data"]["craft_ing2_list"] = [(ing.id, ing.name.value) for ing in ingredients2]
-    fsm["state"] = FsmState.CRAFT_INGREDIENT2
-    lines = ["Выберите второй компонент (введите номер или название):"]
-    for i, (_, name) in enumerate(fsm["data"]["craft_ing2_list"], 1):
-        lines.append(f"  {i}. {name}")
-    await message.answer("\n".join(lines))
-
-
-async def vk_craft_ingredient2_next(message: Message, normalized_text: str):
-    """Второй компонент выбран → выдать код(ы) лекарства."""
-    peer_id = message.peer_id
-    fsm = get_fsm(peer_id)
-    ing_list = fsm.get("data", {}).get("craft_ing2_list", [])
-    ing1_id = fsm.get("data", {}).get("craft_ing1_id")
-    med_name = fsm.get("data", {}).get("craft_med_type", "IMMUNIC")
-    use_alchemy = fsm.get("data", {}).get("use_alchemy", False)
-    craft_peer_id = fsm.get("data", {}).get("craft_peer_id", peer_id)
-    fsm["state"] = None
-    fsm["data"] = {}
-
-    if not ing_list or not ing1_id:
-        await message.answer("Ошибка сессии. Начните крафт заново.")
-        return
-    async with async_session() as session:
-        ingredients = []
-        for ing_id, _ in ing_list:
-            r = await session.execute(select(Ingredient).where(Ingredient.id == ing_id))
-            ing = r.scalar_one_or_none()
-            if ing:
-                ingredients.append(ing)
-    chosen = _resolve_ingredient_from_list(ingredients, normalized_text)
-    if not chosen:
-        await message.answer("Не найдено. Введите номер из списка или название ингредиента.")
-        return
-    ing2_id = chosen.id
-    med_type = MedType[med_name] if med_name else MedType.IMMUNIC
-
-    async with async_session() as session:
-        result = await session.execute(
-            select(Medicine).where(
-                Medicine.med_type == med_type,
-                or_(
-                    and_(Medicine.ingredient1_id == ing1_id, Medicine.ingredient2_id == ing2_id),
-                    and_(Medicine.ingredient1_id == ing2_id, Medicine.ingredient2_id == ing1_id),
-                )
-            )
-        )
-        medicine = result.scalar_one_or_none()
-
-        if medicine:
-            code = medicine.code if medicine.code is not None else medicine.id
-            codes_msg = f"Код лекарства: {code}"
-        elif med_type == MedType.SPECIAL:
-            code = None
-            codes_msg = "Код лекарства: Нерабочее"
-        else:
-            code = None
-            codes_msg = "Лекарство с таким составом не найдено в базе."
-
-        extra_codes = []
-        if (code is not None or med_type == MedType.SPECIAL) and craft_peer_id:
-            user = await get_user_from_vk(session, craft_peer_id, None)
-            if user:
-                skills = _user_active_skill_names(user)
-                if "Менху" in skills or "Степной знахарь" in skills:
-                    same_type_result = await session.execute(select(Medicine).where(Medicine.med_type == med_type))
-                    same_list = list(same_type_result.scalars().all())
-                    if same_list:
-                        extra = random.choice(same_list)
-                        ec = extra.code if extra.code is not None else extra.id
-                        extra_codes.append(f"Дополнительный код (навык Менху/Степной знахарь): {ec}")
-                if use_alchemy and med_type != MedType.SPECIAL:
-                    same_type_result = await session.execute(select(Medicine).where(Medicine.med_type == med_type))
-                    same_list = list(same_type_result.scalars().all())
-                    if same_list:
-                        extra = random.choice(same_list)
-                        ec = extra.code if extra.code is not None else extra.id
-                        extra_codes.append(f"Дополнительный код (алхимический стол): {ec}")
-
-    if extra_codes:
-        codes_msg += "\n" + "\n".join(extra_codes)
-    await message.answer(codes_msg)
 
 
 async def vk_treat_medicines_next(message: Message, raw_codes: str):

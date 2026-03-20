@@ -46,14 +46,6 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint('id')
     )
     op.create_table(
-        'ingredients',
-        sa.Column('id', sa.Integer(), nullable=False),
-        sa.Column('name', sa.Enum('BROWN_TWYRINE', 'BLOOD_TWYRINE', 'BLACK_TWYRINE', 'SAVYUR', 'WHITE_WHIP', 'SECH', 'BRAIN', 'TEETH', 'HEART', 'BLOOD', 'OTHER', name='ingredientname'), nullable=False),
-        sa.Column('category', sa.Enum('HERB', 'ORGAN', name='ingredientcategory'), nullable=False),
-        sa.PrimaryKeyConstraint('id'),
-        sa.UniqueConstraint('name')
-    )
-    op.create_table(
         'locations',
         sa.Column('id', sa.Integer(), nullable=False),
         sa.Column('code', sa.Integer(), nullable=True),
@@ -114,10 +106,6 @@ def upgrade() -> None:
         sa.Column('cure_layer_2', sa.Integer(), nullable=False),
         sa.Column('cure_layer_3', sa.Integer(), nullable=False),
         sa.Column('pain', sa.Integer(), nullable=False),
-        sa.Column('ingredient1_id', sa.Integer(), nullable=True),
-        sa.Column('ingredient2_id', sa.Integer(), nullable=True),
-        sa.ForeignKeyConstraint(['ingredient1_id'], ['ingredients.id']),
-        sa.ForeignKeyConstraint(['ingredient2_id'], ['ingredients.id']),
         sa.PrimaryKeyConstraint('id'),
         sa.UniqueConstraint('code')
     )
@@ -165,6 +153,5 @@ def downgrade() -> None:
     op.drop_table('users')
     op.drop_table('skills')
     op.drop_table('locations')
-    op.drop_table('ingredients')
     op.drop_table('diseases')
     op.drop_table('complications')
