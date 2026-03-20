@@ -1108,13 +1108,13 @@ async def treat_medicines_handler(message: Message, state: FSMContext) -> None:
         return
 
     async with async_session() as session:
-        result = await session.execute(
-            select(Medicine).where(Medicine.code.in_(codes))
-        )
+        distinct_codes = sorted(set(codes))
+        result = await session.execute(select(Medicine).where(Medicine.code.in_(distinct_codes)))
         medicines = list(result.scalars().all())
-    if len(medicines) != len(codes):
-        found_codes = {m.code for m in medicines}
-        missing = [c for c in codes if c not in found_codes]
+
+    found_codes = {m.code for m in medicines}
+    missing = [c for c in distinct_codes if c not in found_codes]
+    if missing:
         await message.answer(f"Не найдены лекарства с кодами: {missing}. Введите коды снова.")
         return
 
@@ -1139,11 +1139,22 @@ async def _treat_finalize(message: Message, state: FSMContext) -> None:
     cure_mod = 0
 
     async with async_session() as session:
-        result = await session.execute(
-            select(Medicine).where(Medicine.code.in_(medicine_codes))
-        )
+        distinct_codes = sorted(set(medicine_codes))
+        result = await session.execute(select(Medicine).where(Medicine.code.in_(distinct_codes)))
         medicines = list(result.scalars().all())
         if not medicines:
+            await message.answer("Лекарства не найдены.")
+            return
+
+        medicines_by_code = {m.code: m for m in medicines if m.code is not None}
+        missing_codes = [c for c in distinct_codes if c not in medicines_by_code]
+        if missing_codes:
+            await message.answer(f"Не найдены лекарства с кодами: {missing_codes}.")
+            return
+
+        # Важно: учитываем кратность по введенным кодам
+        meds_ordered = [medicines_by_code.get(code) for code in medicine_codes]
+        if any(m is None for m in meds_ordered):
             await message.answer("Лекарства не найдены.")
             return
 
@@ -1158,7 +1169,7 @@ async def _treat_finalize(message: Message, state: FSMContext) -> None:
                 pain_sum += s.skill.pain or 0
             if s.disease:
                 pain_sum += s.disease.pain or 0
-        for m in medicines:
+        for m in meds_ordered:
             pain_sum += m.pain or 0
         pain_sum += pain_disease_mod
 
@@ -1171,9 +1182,9 @@ async def _treat_finalize(message: Message, state: FSMContext) -> None:
             )
             return
 
-        cure_1 = sum(m.cure_layer_1 or 0 for m in medicines) + cure_mod
-        cure_2 = sum(m.cure_layer_2 or 0 for m in medicines) + cure_mod
-        cure_3 = sum(m.cure_layer_3 or 0 for m in medicines) + cure_mod
+        cure_1 = sum(m.cure_layer_1 or 0 for m in meds_ordered) + cure_mod
+        cure_2 = sum(m.cure_layer_2 or 0 for m in meds_ordered) + cure_mod
+        cure_3 = sum(m.cure_layer_3 or 0 for m in meds_ordered) + cure_mod
 
         symptom_slots = [
             (s, s.disease)
