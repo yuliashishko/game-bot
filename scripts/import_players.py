@@ -2,166 +2,23 @@
 """
 Импорт игроков из CSV (экспорт из таблицы) в БД.
 
-Колонки CSV: character_name, tg_username, vk_username, is_active, is_admin, is_alive, is_child, weak_zones, skill_1..skill_6.
-- weak_zones: список enum через запятую в квадратных скобках, например [HEAD, CHEST, LEFT_ARM].
-- skill_N: JSON с полем "name" (название навыка для поиска в таблице skills).
+Колонки CSV: character_name, tg_username, vk_username, telegram_id, is_active, is_admin,
+is_alive, is_child, weak_zones, skill_1..skill_6.
 
 Использование:
   python scripts/import_players.py [путь/к/players_import.csv]
-По умолчанию: players_import.csv в корне проекта.
 """
 import argparse
 import asyncio
 import csv
-import json
 import os
-import re
 import sys
-from urllib.parse import urlparse, unquote
 
 # Корень проекта в path для импорта config/database
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sqlalchemy import select, delete
 from database import async_session
-from database.models import User, Slot, Skill, WeakZone, InfectionStatus, Recipe
-
-
-def parse_weak_zones(raw: str) -> list:
-    """[HEAD, CHEST, LEFT_ARM] -> [WeakZone.HEAD, ...]"""
-    if not raw or not raw.strip():
-        return []
-    raw = raw.strip()
-    # Убрать скобки и разбить по запятой
-    if raw.startswith("["):
-        raw = raw[1:]
-    if raw.endswith("]"):
-        raw = raw[:-1]
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    result = []
-    for p in parts:
-        try:
-            result.append(WeakZone[p])
-        except KeyError:
-            pass
-    return result
-
-
-def _parse_recipe_names(raw: str | None) -> list[str] | None:
-    value = (raw or "").strip()
-    if not value:
-        return []
-    tokens = []
-    for part in value.split(","):
-        token = part.strip().strip('"').strip("'")
-        if token:
-            tokens.append(token)
-    return tokens
-
-
-def _to_recipe_enums(recipe_names: list[str] | None) -> list[Recipe]:
-    if recipe_names is None:
-        return []
-    out: list[Recipe] = []
-    for name in recipe_names:
-        try:
-            out.append(Recipe[name])
-        except KeyError:
-            continue
-    return out
-
-
-def parse_skill_meta(cell: str) -> dict:
-    """Из ячейки с JSON навыка извлечь поля навыка."""
-    meta = {
-        "name": None,
-        "description": None,
-        "is_health": None,
-        "pain": None,
-        "recipes": None,
-    }
-    if not cell or not cell.strip():
-        return meta
-    raw = cell.strip()
-    # Убрать лишнюю запятую в конце (часто в экспорте)
-    if raw.endswith(","):
-        raw = raw[:-1]
-    try:
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            name = data.get("name")
-            description = data.get("description")
-            is_health = data.get("is_health")
-            pain = data.get("pain")
-            recipes = data.get("recipes")
-            meta["name"] = name if isinstance(name, str) else None
-            meta["description"] = description if isinstance(description, str) else None
-            meta["is_health"] = is_health if isinstance(is_health, bool) else None
-            meta["pain"] = pain if isinstance(pain, int) else None
-            if isinstance(recipes, list):
-                meta["recipes"] = [r for r in recipes if isinstance(r, str)]
-            return meta
-        return meta
-    except json.JSONDecodeError:
-        # Фолбэк для строк с невалидным JSON (например recipes: [CRAFT_IMMUNICS]).
-        m = re.search(r'"name"\s*:\s*"([^"]+)"', raw)
-        md = re.search(r'"description"\s*:\s*"([^"]*)"', raw)
-        mh = re.search(r'"is_health"\s*:\s*(true|false)', raw, flags=re.IGNORECASE)
-        mp = re.search(r'"pain"\s*:\s*(-?\d+)', raw)
-        mr = re.search(r'"recipes"\s*:\s*\[([^\]]*)\]', raw)
-        meta["name"] = m.group(1) if m else None
-        meta["description"] = md.group(1) if md else None
-        if mh:
-            meta["is_health"] = mh.group(1).lower() == "true"
-        if mp:
-            try:
-                meta["pain"] = int(mp.group(1))
-            except ValueError:
-                meta["pain"] = None
-        if mr:
-            meta["recipes"] = _parse_recipe_names(mr.group(1))
-        return meta
-    return meta
-
-
-def slot_layer_from_position(position: int) -> int:
-    return (position % 3) + 1
-
-
-def parse_bool(raw: str, default: bool = False) -> bool:
-    value = (raw or "").strip().lower()
-    if not value:
-        return default
-    return value in ("1", "true", "yes", "да")
-
-
-def normalize_vk_username(raw: str) -> str | None:
-    """
-    Привести vk_username к short name / idNNN:
-    - https://vk.com/username -> username
-    - vk.com/username -> username
-    - @username -> username
-    - отрезать query/hash и декодировать %xx
-    """
-    value = (raw or "").strip()
-    if not value:
-        return None
-
-    value = value.replace("\\", "/").strip()
-    if value.startswith("@"):
-        value = value[1:].strip()
-
-    if value.startswith("http://") or value.startswith("https://"):
-        parsed = urlparse(value)
-        path = (parsed.path or "").strip("/")
-        value = path or value
-    elif value.lower().startswith("vk.com/"):
-        value = value.split("/", 1)[1].strip()
-
-    # Срезаем query/hash, если остались
-    value = value.split("?", 1)[0].split("#", 1)[0].strip().strip("/")
-    value = unquote(value).strip()
-    return value or None
+from player_import import upsert_player_from_row_dict
 
 
 async def run(csv_path: str, replace_existing: bool = True) -> None:
@@ -177,91 +34,26 @@ async def run(csv_path: str, replace_existing: bool = True) -> None:
         print("В CSV нет строк.", file=sys.stderr)
         sys.exit(1)
 
+    imported = 0
     async with async_session() as session:
         for row in rows:
-            tg_username = (row.get("tg_username") or "").strip()
-            if not tg_username:
-                print(f"Пропуск строки без tg_username: {row.get('character_name', '?')}", file=sys.stderr)
-                continue
-
-            character_name = (row.get("character_name") or tg_username).strip()
-            vk_username = normalize_vk_username(row.get("vk_username") or "")
-            # telegram_id игнорируем, но булевые флаги берём из CSV
-            is_active = parse_bool(row.get("is_active") or "", default=False)
-            is_admin = parse_bool(row.get("is_admin") or "", default=False)
-            is_alive = parse_bool(row.get("is_alive") or "", default=True)
-            is_child = parse_bool(row.get("is_child") or "", default=False)
-            weak_zones = parse_weak_zones(row.get("weak_zones") or "")
-
-            # Существующий пользователь: обновить или пропустить
-            existing = await session.execute(select(User).where(User.tg_username == tg_username))
-            user = existing.scalar_one_or_none()
-            if user and replace_existing:
-                user.character_name = character_name
-                user.vk_username = vk_username
-                user.is_active = is_active
-                user.is_admin = is_admin
-                user.is_alive = is_alive
-                user.is_child = is_child
-                user.weak_zones = weak_zones
-                user.infection_status = InfectionStatus.HEALTHY
-                # Удалить старые слоты и создать заново
-                await session.execute(delete(Slot).where(Slot.user_id == user.id))
-                await session.flush()
-            elif user:
-                print(f"Пропуск существующего: {tg_username}")
-                continue
-            else:
-                user = User(
-                    character_name=character_name,
-                    tg_username=tg_username,
-                    vk_username=vk_username,
-                    is_active=is_active,
-                    is_admin=is_admin,
-                    is_alive=is_alive,
-                    is_child=is_child,
-                    weak_zones=weak_zones,
-                    infection_status=InfectionStatus.HEALTHY,
+            try:
+                user, info = await upsert_player_from_row_dict(
+                    session, row, replace_existing=replace_existing
                 )
-                session.add(user)
-                await session.flush()
-
-            # Слоты по skill_1..skill_6
-            for pos in range(6):
-                key = f"skill_{pos + 1}"
-                skill_meta = parse_skill_meta(row.get(key) or "")
-                skill_name = skill_meta["name"]
-                skill = None
-                if skill_name:
-                    health_skill = bool(skill_meta["is_health"])
-                    skill_description = skill_meta["description"] or ""
-                    skill_pain = skill_meta["pain"]
-                    if not isinstance(skill_pain, int):
-                        skill_pain = 0
-                    skill_recipes = _to_recipe_enums(skill_meta["recipes"])
-                    new_skill = Skill(
-                        name=skill_name,
-                        description=skill_description,
-                        is_health=health_skill,
-                        pain=skill_pain,
-                        recipes=skill_recipes,
-                    )
-                    session.add(new_skill)
-                    await session.flush()
-                    skill = new_skill
-                    print(f"  Создан новый навык: «{skill_name}»")
-                layer = slot_layer_from_position(pos)
-                slot = Slot(
-                    user_id=user.id,
-                    position=pos,
-                    layer=layer,
-                    skill_id=skill.id if skill else None,
-                    disease_id=None,
-                )
-                session.add(slot)
+            except ValueError as e:
+                print(f"Строка «{row.get('character_name', '?')}»: {e}", file=sys.stderr)
+                continue
+            if user is None:
+                print(info)
+                continue
+            imported += 1
+            for line in info.split("\n"):
+                if line.strip():
+                    print(line)
 
         await session.commit()
-    print(f"Импортировано игроков: {len(rows)}")
+    print(f"Импортировано игроков: {imported} из {len(rows)}")
 
 
 def main() -> None:

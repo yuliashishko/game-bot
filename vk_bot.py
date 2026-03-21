@@ -47,7 +47,6 @@ from game_logic import (
     _apply_trauma_by_code,
     do_treat_finalize,
 )
-
 if not VK_TOKEN:
     raise RuntimeError("VK_TOKEN не задан в .env")
 
