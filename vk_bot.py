@@ -430,7 +430,9 @@ async def vk_me_handler(message: Message):
     life_status = "Мёртв" if not current_user.is_alive else "Жив"
     weak_zones = [z.value if hasattr(z, "value") else str(z) for z in (current_user.weak_zones or [])]
     char_name = current_user.character_name or "Неизвестный"
-    msg = f"👤 Профиль игрока {char_name}\n\n"
+    vk_line = current_user.vk_username or "не указан"
+    msg = f"👤 Профиль игрока {char_name}\n"
+    msg += f"🔗 VK (логин в базе): {vk_line}\n\n"
     msg += f"☠️ Статус персонажа: {life_status}\n"
     msg += f"🦠 Статус инфекции: {status_text}\n"
     msg += f"❤️ Здоровье: {health_current} / {health_max}\n"
@@ -479,7 +481,9 @@ async def vk_profile_details_handler(message: Message):
             skills.append(f"• {slot.skill.name}: {desc}" if desc else f"• {slot.skill.name}")
 
     char_name = current_user.character_name or "Неизвестный"
-    msg = f"📋 Детальный профиль: {char_name}\n\n"
+    vk_line = current_user.vk_username or "не указан"
+    msg = f"📋 Детальный профиль: {char_name}\n"
+    msg += f"🔗 VK (логин в базе): {vk_line}\n\n"
     msg += "Болячки (раны):\n" + ("\n".join(wounds) if wounds else "Нет") + "\n\n"
     msg += "Травмы:\n" + ("\n".join(traumas) if traumas else "Нет") + "\n\n"
     msg += "Симптомы:\n" + ("\n".join(symptoms) if symptoms else "Нет") + "\n\n"

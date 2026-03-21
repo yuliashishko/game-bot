@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import sys
 
@@ -240,8 +241,9 @@ async def command_me_handler(message: Message) -> None:
         # Собираем финальное сообщение
         status_text = user.infection_status.value if user.infection_status else "Здоров"
         char_name = user.character_name if user.character_name else "Неизвестный"
-        
-        msg = f"👤 <b>Профиль игрока {char_name} (@{username})</b>\n\n"
+        vk_disp = (user.vk_username or "").strip() or "не указан"
+        msg = f"👤 <b>Профиль игрока {char_name} (@{username})</b>\n"
+        msg += f"🔗 <b>VK (логин в базе):</b> {html.escape(vk_disp)}\n\n"
         msg += f"🦠 <b>Статус инфекции:</b> {status_text}\n"
         msg += f"❤️ <b>Здоровье:</b> {health_current} / {health_max}\n"
         msg += f"🩸 <b>Ран:</b> {wounds}\n\n"
