@@ -145,14 +145,16 @@ async def apply_hourly_symptoms(session, *, skip_if_night: bool = True):
     """
     Для всех заражённых, у кого от last_infection_time прошёл хотя бы час,
     выполняет «Получить симптом» и обновляет last_infection_time.
+    Если включена пауза (game_settings.pause_active), ничего не делает.
     Если skip_if_night и включена ночь (game_settings.night_active), ничего не делает.
     Возвращает список пар (user, message) по каждому применённому симптому.
     """
-    if skip_if_night:
-        r = await session.execute(select(GameSettings).where(GameSettings.id == 1))
-        gs = r.scalar_one_or_none()
-        if gs and gs.night_active:
-            return []
+    r = await session.execute(select(GameSettings).where(GameSettings.id == 1))
+    gs = r.scalar_one_or_none()
+    if gs and gs.pause_active:
+        return []
+    if skip_if_night and gs and gs.night_active:
+        return []
     now = datetime.utcnow()
     threshold = now - timedelta(hours=HOURLY_SYMPTOM_INTERVAL_HOURS)
     q = (
